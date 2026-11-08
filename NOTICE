@@ -1,0 +1,24 @@
+horizon-husksync
+
+This product is a Rust re-implementation of HuskSync
+(https://github.com/WiIIiam278/HuskSync), Copyright (c) William278 <will27528@gmail.com> and
+contributors (Copyright (c) contributors), licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). It was written from a reading of HuskSync 4.1.0's
+source (https://github.com/WiIIiam278/HuskSync, commit 827f7be): the snapshot JSON format, the data
+type serializations, the MySQL/MariaDB schema and statements, the Redis keys, channels and message
+format, the LOCKSTEP and DELAY synchronisation rules, the locked-player rules, the commands, the
+en-gb message texts and the config keys and defaults. Changes: rewritten in Rust for the Horizon
+game server; messages are plain text (no MiniMessage); no HuskSync source file is included. Database
+statements and the SQL schema are reproduced from HuskSync's `MySqlDatabase.java` and
+`mariadb_schema.sql`.
+
+HuskSync's maintainers and contributors named in its about menu: William278, DaUltraMarine, CatTeaA,
+HarvelsX, HookWoods, mfnalex, MrPippi, Preva1l, quiquelhappy, hanbings, Stampede2011, VinerDream,
+WaterArchery, and its translators.
+
+The item storage layout follows Item-NBT-API (https://github.com/tr7zw/Item-NBT-API,
+MIT License, Copyright (c) tr7zw), which HuskSync uses; it was learned from that
+library's published binary, and none of its code is included.
+
+HuskSync is a trademark of its author. This project is not affiliated with or
+endorsed by HuskSync or William278.
