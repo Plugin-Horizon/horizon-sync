@@ -1,3 +1,5 @@
+// COMPILED OUT (see lib.rs: #[cfg(any())] mod legacy_glue). This is the horizon-rust glue of
+// horizonsync, kept verbatim as the logic reference for the pass that adds the missing player-data APIs.
 // HorizonSync's engine side, a module of `crate::game` (so it reaches `Game`'s fields and
 // the hub's guests). It turns the core's actions into changes on the server's players and
 // reads players back as their vanilla compound (`playerdata::player_tag`, what Horizon writes to
@@ -212,9 +214,14 @@ pub(super) fn tick(game: &mut Game<'_>) {
                 }
             }
             core::Action::Message { player: None, text, .. } => log::info!("[HorizonSync] {text}"),
-            core::Action::Component { player: Some(p), text, json } => {
-                // Clickable chat: the plain words with the component (click and hover events).
-                game.native_tell(p, Text::literal(text).with_component(json));
+            core::Action::Component { player: Some(p), text, json, overlay } => {
+                // Clickable chat or the action bar: the plain words with the component (click and hover events).
+                let line = Text::literal(text).with_component(json);
+                if overlay {
+                    game.native_action_bar(p, line);
+                } else {
+                    game.native_tell(p, line);
+                }
             }
             core::Action::Component { player: None, text, .. } => log::info!("[HorizonSync] {text}"),
             core::Action::OpenMenu { viewer, title, rows, items, edit } => {
@@ -325,7 +332,10 @@ fn apply(game: &mut Game<'_>, player: u128, plan: &core::ApplyPlan) -> bool {
     if let Some((slots, held)) = &plan.inventory {
         // BukkitData.Items.Inventory.apply: cursor and 2x2 grid are cleared by the helper.
         let mut s = stacks_of(slots);
-        s.resize(core::data::INVENTORY_SLOTS, None);
+        // HuskSync's snapshot holds Paper's 43 slots; a Horizon player inventory has 41 (36 + 4
+        // armour + off hand). Slots 41 and 42 stay in the stored snapshot as read; the engine
+        // gets its 41.
+        s.resize(41, None);
         let selected = Some((*held).clamp(0, 8) as usize);
         if let Err(e) = game.native_set_inventory(player, super::NativeInventoryKind::Player, s, selected) {
             log::warn!("horizonsync: {name}'s inventory was not applied: {e}");

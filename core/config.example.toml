@@ -1,7 +1,7 @@
-# HorizonSync: config/horizonsync/config.toml on the Horizon server.
-# Key names follow HuskSync's config.yml (and server.yml's `name`), so the values can be copied
-# from a Paper server of the same network. Every server of a cluster must agree on cluster_id,
-# the database, Redis, compress_data and the features.
+# HorizonSync: config/horizonsync/config.toml on the Horizon server. Only used when the server has no
+# plugins/HuskSync/config.yml: that file (HuskSync's own, with server.yml and messages-<language>.yml)
+# is read first. Key names follow HuskSync's config.yml (and server.yml's `name`). Every server of a
+# cluster must agree on cluster_id, the database, Redis, compress_data and the features.
 
 # This server's name, as the proxy calls it (HuskSync's server.yml). Empty: the folder name.
 server_name = ""
@@ -24,7 +24,8 @@ host = "localhost"
 port = 3306
 database = "HuskSync"
 username = "root"
-password = "pa55w0rd"
+# Empty on purpose: set the database password here (or read it from HuskSync's config.yml).
+password = ""
 use_ssl = false
 maximum_pool_size = 10
 minimum_idle = 10

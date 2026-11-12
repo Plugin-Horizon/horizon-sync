@@ -6,9 +6,11 @@
 use crate::nbt::{parse_snbt, Nbt};
 use serde::{Deserialize, Serialize};
 
-/// `Data.Items.Inventory.INVENTORY_SLOT_COUNT`: 0..36 main (0..9 hotbar), 36 feet, 37 legs,
-/// 38 chest, 39 head, 40 off hand (Bukkit's `PlayerInventory.getContents()` order).
-pub const INVENTORY_SLOTS: usize = 41;
+/// The slots HuskSync's inventory holds as Paper writes it: `size:43` in every live snapshot.
+/// 0..36 main (0..9 hotbar), 36 feet, 37 legs, 38 chest, 39 head, 40 off hand (Bukkit's
+/// `PlayerInventory.getContents()` order). HuskSync 4.1's `INVENTORY_SLOT_COUNT` is 41; slots 41 and
+/// 42 are not described there, and no live snapshot has an item in them. They are kept as read.
+pub const INVENTORY_SLOTS: usize = 43;
 /// `Data.Items.EnderChest.ENDER_CHEST_SLOT_COUNT`.
 pub const ENDER_CHEST_SLOTS: usize = 27;
 
@@ -20,9 +22,10 @@ pub struct StoredItem {
     pub data_version: i32,
 }
 
-/// NBT-API `NBTItem.convertItemArraytoNBT`: `{size:N, items:[{Slot:i, <item>, DataVersion:v}]}`.
-/// Empty slots are left out; `Slot` is an int.
-pub fn items_to_nbt(slots: &[Option<StoredItem>]) -> Nbt {
+/// The `items` list of NBT-API's `convertItemArraytoNBT`: one compound per stack, `Slot` and
+/// `DataVersion` first (as Paper writes them), then the item's own keys in their order. Empty slots
+/// are left out; `Slot` is an int.
+fn items_list(slots: &[Option<StoredItem>]) -> Vec<Nbt> {
     let mut list = Vec::new();
     for (i, slot) in slots.iter().enumerate() {
         let Some(stored) = slot else { continue };
@@ -32,18 +35,40 @@ pub fn items_to_nbt(slots: &[Option<StoredItem>]) -> Nbt {
         if map.get("id").and_then(Nbt::as_str) == Some("minecraft:air") {
             continue;
         }
-        let mut entry = Nbt::Compound(map.clone());
         // Vanilla's SNBT reader takes `NaNd`/`Infinityf` as strings, so a non-finite number
         // would come back on Paper as a string or cost the whole inventory type. Clamp them.
-        clamp_non_finite(&mut entry);
+        let mut tag = Nbt::Compound(map.clone());
+        clamp_non_finite(&mut tag);
+        let Nbt::Compound(rest) = tag else { continue };
+        let mut entry = Nbt::compound();
         entry.put("Slot", Nbt::Int(i as i32));
         entry.put("DataVersion", Nbt::Int(stored.data_version));
+        for (key, value) in rest {
+            if key != "Slot" && key != "DataVersion" {
+                entry.put(&key, value);
+            }
+        }
         list.push(entry);
     }
+    list
+}
+
+/// NBT-API's `itemStackArrayToNBT` of an inventory's `items` compound: `{size:N,items:[...]}`.
+pub fn items_to_nbt(slots: &[Option<StoredItem>]) -> Nbt {
     let mut root = Nbt::compound();
     root.put("size", Nbt::Int(slots.len() as i32));
-    root.put("items", Nbt::List(list));
+    // Paper writes no `items` list when every slot is empty (`{size:27}`).
+    let items = items_list(slots);
+    if !items.is_empty() {
+        root.put("items", Nbt::List(items));
+    }
     root
+}
+
+/// The ender chest's compound: `{items:[...],size:N}` (the order Paper's `itemStackArrayToNBT`
+/// gives the chest, unlike the inventory's `items` compound).
+pub fn ender_chest_to_nbt(slots: &[Option<StoredItem>]) -> Nbt {
+    items_to_nbt(slots)
 }
 
 /// Replaces NaN with 0 and infinities with the largest finite value of the same sign, in place,
@@ -115,7 +140,7 @@ pub fn items_from_nbt(tag: &Nbt, size: usize, fallback_version: i32) -> Vec<Opti
     slots
 }
 
-/// `husksync:inventory`: `{items:{size:41,items:[...]},held_item_slot:N}`.
+/// `husksync:inventory`: `{held_item_slot:N,items:{size:43,items:[...]}}`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inventory {
     pub slots: Vec<Option<StoredItem>>,
@@ -123,10 +148,11 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    /// `{held_item_slot:N,items:{items:[...],size:43}}`: Paper's SNBT, keys sorted.
     pub fn serialize(&self) -> String {
         let mut root = Nbt::compound();
-        root.put("items", items_to_nbt(&self.slots));
         root.put("held_item_slot", Nbt::Int(self.held_item_slot));
+        root.put("items", items_to_nbt(&self.slots));
         root.to_snbt()
     }
 
@@ -151,7 +177,7 @@ pub struct EnderChest {
 
 impl EnderChest {
     pub fn serialize(&self) -> String {
-        items_to_nbt(&self.slots).to_snbt()
+        ender_chest_to_nbt(&self.slots).to_snbt()
     }
 
     pub fn deserialize(s: &str, fallback_version: i32) -> Result<Self, String> {
@@ -320,7 +346,7 @@ mod tests {
         let s = inv.serialize();
         assert_eq!(
             s,
-            "{held_item_slot:2,items:{items:[{DataVersion:5023,Slot:0,count:5,id:\"minecraft:stone\"},{DataVersion:5023,Slot:40,count:1,id:\"minecraft:stone\"}],size:41}}"
+            "{held_item_slot:2,items:{items:[{DataVersion:5023,Slot:0,count:5,id:\"minecraft:stone\"},{DataVersion:5023,Slot:40,count:1,id:\"minecraft:stone\"}],size:43}}"
         );
         assert_eq!(Inventory::deserialize(&s, 5023).unwrap(), inv);
     }
@@ -329,9 +355,9 @@ mod tests {
     fn reads_paper_written_inventory() {
         // NBT-API output on Paper 26.3 (abridged): a sword with components, an older item
         // without a DataVersion, and a duplicate slot that overflows.
-        let s = r#"{held_item_slot:0,items:{items:[{DataVersion:5023,Slot:0,components:{"minecraft:damage":12,"minecraft:enchantments":{"minecraft:sharpness":5}},count:1,id:"minecraft:diamond_sword"},{Slot:0,count:3,id:"minecraft:torch"},{DataVersion:4671,Slot:39,count:1,id:"minecraft:iron_helmet"}],size:41}}"#;
+        let s = r#"{held_item_slot:0,items:{size:43,items:[{Slot:0,DataVersion:5023,components:{"minecraft:damage":12,"minecraft:enchantments":{"minecraft:sharpness":5}},count:1,id:"minecraft:diamond_sword"},{Slot:0,count:3,id:"minecraft:torch"},{Slot:39,DataVersion:4671,count:1,id:"minecraft:iron_helmet"}]}}"#;
         let inv = Inventory::deserialize(s, 4786).unwrap();
-        assert_eq!(inv.slots.len(), 41);
+        assert_eq!(inv.slots.len(), 43);
         let sword = inv.slots[0].as_ref().unwrap();
         assert_eq!(sword.item.str_at("id"), Some("minecraft:diamond_sword"));
         assert!(sword.item.get("Slot").is_none());
@@ -346,9 +372,9 @@ mod tests {
         let e = EnderChest {
             slots: vec![None; 27],
         };
-        assert_eq!(e.serialize(), "{items:[],size:27}");
+        assert_eq!(e.serialize(), "{size:27}");
         assert_eq!(
-            EnderChest::deserialize("{items:[],size:27}", 5023).unwrap(),
+            EnderChest::deserialize("{size:27}", 5023).unwrap(),
             e
         );
     }

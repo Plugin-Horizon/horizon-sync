@@ -106,9 +106,26 @@ pub fn now() -> chrono::DateTime<chrono::FixedOffset> {
     chrono::Local::now().fixed_offset()
 }
 
-/// gson-javatime-serialisers: `DateTimeFormatter.ISO_OFFSET_DATE_TIME`.
+/// `DateTimeFormatter.ISO_OFFSET_DATE_TIME`, as the Gson adapter writes it: the fraction of a second
+/// has only the digits it needs (none when zero), and a zero offset is written `Z`.
 pub fn format_timestamp(t: &chrono::DateTime<chrono::FixedOffset>) -> String {
-    t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)
+    let mut s = t.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let nanos = t.timestamp_subsec_nanos();
+    if nanos > 0 {
+        s.push('.');
+        s.push_str(format!("{nanos:09}").trim_end_matches('0'));
+    }
+    let offset = t.offset().local_minus_utc();
+    if offset == 0 {
+        s.push('Z');
+    } else {
+        let a = offset.abs();
+        s.push_str(&format!("{}{:02}:{:02}", if offset < 0 { '-' } else { '+' }, a / 3600, a % 3600 / 60));
+        if a % 60 != 0 {
+            s.push_str(&format!(":{:02}", a % 60));
+        }
+    }
+    s
 }
 
 pub fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -138,8 +155,22 @@ mod tests {
 
     #[test]
     fn timestamps() {
-        let t = parse_timestamp("2026-11-06T06:00:00.5+01:00").unwrap();
-        assert_eq!(format_timestamp(&t), "2026-11-06T06:00:00.500+01:00");
         assert!(parse_timestamp("2026-11-06T06:00:00Z").is_some());
+    }
+
+    #[test]
+    fn timestamps_are_written_as_iso_offset_date_time() {
+        // Fraction: only the digits needed; zero offset: `Z`; other offsets: `+HH:MM`.
+        let t = parse_timestamp("2026-11-06T06:00:00.5+01:00").unwrap();
+        assert_eq!(format_timestamp(&t), "2026-11-06T06:00:00.5+01:00");
+        let t = parse_timestamp("2026-11-06T06:00:00+00:00").unwrap();
+        assert_eq!(format_timestamp(&t), "2026-11-06T06:00:00Z");
+        let t = parse_timestamp("2026-11-11T09:30:15.250000Z").unwrap();
+        assert_eq!(format_timestamp(&t), "2026-11-11T09:30:15.25Z");
+        let t = parse_timestamp("2026-11-11T09:30:15.000000123-03:30").unwrap();
+        assert_eq!(format_timestamp(&t), "2026-11-11T09:30:15.000000123-03:30");
+        // Round trip through the parser.
+        let back = parse_timestamp(&format_timestamp(&t)).unwrap();
+        assert_eq!(back, t);
     }
 }

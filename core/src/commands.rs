@@ -289,7 +289,9 @@ fn status_lines(engine: &Engine) -> Vec<String> {
 /// `/horizonsync reload`: read the config file again. As in HuskSync, connections and the like keep
 /// their start-up values until a restart.
 fn reload(engine: &Engine) -> Result<(), String> {
-    let mut fresh = crate::config::Config::load_or_create(&engine.dir)?;
+    // `engine.dir` is `<server>/config/horizonsync`: the server folder is two levels up.
+    let server_dir = engine.dir.parent().and_then(|p| p.parent()).unwrap_or(&engine.dir);
+    let mut fresh = crate::config::Config::load(server_dir, &engine.dir)?;
     if fresh.server_name.trim().is_empty() {
         fresh.server_name = engine.platform.server_name.clone();
     }

@@ -1,11 +1,13 @@
 //! A small NBT tree and its SNBT text form.
 //!
 //! HuskSync keeps item stacks as SNBT: the text `CompoundTag.toString()` prints on Paper, read
-//! back with Mojang's `TagParser`. The writer here prints what Mojang's `StringTagVisitor` prints
-//! (keys sorted, typed suffixes, `[B;`/`[I;`/`[L;` arrays); the reader takes that and the usual
-//! hand-written variants (unquoted strings, `true`/`false`, either quote, escapes).
+//! back with Mojang's `TagParser`. The writer prints the shape of Mojang's `StringTagVisitor`
+//! (typed suffixes, `[B;`/`[I;`/`[L;` arrays, compact, no spaces). Keys are written in the order the
+//! tree holds them: a compound read from Paper is written back in Paper's order, and a new compound
+//! in the order it was built. The reader takes that and the usual hand-written variants (unquoted
+//! strings, `true`/`false`, either quote, escapes).
 
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 use std::fmt::Write as _;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,14 +21,15 @@ pub enum Nbt {
     ByteArray(Vec<i8>),
     String(String),
     List(Vec<Nbt>),
-    Compound(BTreeMap<String, Nbt>),
+    /// Keys keep the order they were read or inserted in (Paper's order survives a round trip).
+    Compound(IndexMap<String, Nbt>),
     IntArray(Vec<i32>),
     LongArray(Vec<i64>),
 }
 
 impl Nbt {
     pub fn compound() -> Self {
-        Nbt::Compound(BTreeMap::new())
+        Nbt::Compound(IndexMap::new())
     }
 
     pub fn get(&self, key: &str) -> Option<&Nbt> {
@@ -52,7 +55,7 @@ impl Nbt {
 
     pub fn remove(&mut self, key: &str) -> Option<Nbt> {
         match self {
-            Nbt::Compound(map) => map.remove(key),
+            Nbt::Compound(map) => map.shift_remove(key),
             _ => None,
         }
     }
@@ -234,7 +237,11 @@ fn write_snbt(tag: &Nbt, out: &mut String) {
         }
         Nbt::Compound(map) => {
             out.push('{');
-            for (i, (k, v)) in map.iter().enumerate() {
+            // Paper's SNBT (as HuskSync stores it) lists a compound's keys sorted, by Java's
+            // String order (UTF-16 units; the same as bytes for these ASCII keys).
+            let mut entries: Vec<(&String, &Nbt)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+            for (i, (k, v)) in entries.into_iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
@@ -319,7 +326,7 @@ impl Parser<'_> {
     fn compound(&mut self) -> Result<Nbt, String> {
         self.enter()?;
         self.expect(b'{')?;
-        let mut map = BTreeMap::new();
+        let mut map = IndexMap::new();
         self.ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
@@ -569,6 +576,16 @@ mod tests {
         assert_eq!(
             c.to_snbt(),
             r#"{count:3,id:"minecraft:stone","minecraft:weird key":1b}"#
+        );
+    }
+
+    #[test]
+    fn writes_keys_sorted_as_paper_does() {
+        // Key order of a live Paper snapshot (checked on real rows, 2026-11-11): sorted.
+        let text = r#"{held_item_slot:2,items:{size:43,items:[{Slot:40,DataVersion:5023,id:"minecraft:shield",count:1}]}}"#;
+        assert_eq!(
+            parse_snbt(text).unwrap().to_snbt(),
+            r#"{held_item_slot:2,items:{items:[{DataVersion:5023,Slot:40,count:1,id:"minecraft:shield"}],size:43}}"#
         );
     }
 

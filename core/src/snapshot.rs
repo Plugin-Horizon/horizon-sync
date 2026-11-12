@@ -12,7 +12,7 @@ use crate::snappy;
 use crate::util::{self, compare_versions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// `DataSnapshot.CURRENT_FORMAT_VERSION`.
 pub const FORMAT_VERSION: i32 = 5;
@@ -56,7 +56,7 @@ pub struct Packed {
     #[serde(default)]
     pub format_version: i32,
     #[serde(default)]
-    pub data: BTreeMap<String, String>,
+    pub data: IndexMap<String, String>,
 }
 
 /// `DataException.Reason`.
@@ -96,7 +96,7 @@ impl Packed {
         platform: &Platform,
         cause: &str,
         pinned: bool,
-        data: BTreeMap<String, String>,
+        data: IndexMap<String, String>,
     ) -> Self {
         Packed {
             id: util::uuid_string(util::random_uuid()),
@@ -131,8 +131,10 @@ impl Packed {
         c
     }
 
+    /// The document as Gson writes it on Paper: fields in declaration order, compact, and Gson's
+    /// HTML-safe escapes, so a snapshot read from Paper is written back byte for byte.
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        gson_escape(&serde_json::to_string(self).unwrap_or_default())
     }
 
     pub fn to_bytes(&self, compress: bool) -> Vec<u8> {
@@ -190,6 +192,18 @@ impl Packed {
     }
 }
 
+/// Gson's default escapes (`<` `>` `&` `=` `'`, and the two line separators). They occur only inside
+/// JSON strings, so replacing them in the text is exact.
+fn gson_escape(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('=', "\\u003d")
+        .replace('\'', "\\u0027")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 fn parse_json(bytes: &[u8]) -> Result<Packed, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("snapshot JSON: {e}"))
 }
@@ -234,7 +248,7 @@ mod tests {
 
     #[test]
     fn json_shape_and_round_trip() {
-        let mut data = BTreeMap::new();
+        let mut data = IndexMap::new();
         data.insert(
             keys::HEALTH.into(),
             r#"{"health":20.0,"health_scale":20.0,"is_health_scaled":false}"#.into(),
@@ -279,7 +293,7 @@ mod tests {
 
     #[test]
     fn validation_follows_husksync() {
-        let mut s = Packed::new(&platform(), "API", false, BTreeMap::new());
+        let mut s = Packed::new(&platform(), "API", false, IndexMap::new());
         s.minecraft_version = "26.4".into();
         assert_eq!(s.validate(&platform()), Err(Invalid::MinecraftVersion));
         s.minecraft_version = "1.21.11".into();
@@ -289,6 +303,48 @@ mod tests {
         s.format_version = 3;
         assert_eq!(s.validate(&platform()), Err(Invalid::Legacy));
         assert_eq!(truncate_cause(&"X".repeat(40)).len(), 31);
+    }
+
+    /// A document laid out the way Paper's HuskSync 4.1 writes one (hand-written values; the field
+    /// and key order, the SNBT shapes and the escapes are the live ones). Decoding and writing it
+    /// again must give the same bytes, for the JSON, the inventory and the ender chest.
+    #[test]
+    fn paper_document_round_trips_byte_for_byte() {
+        // Shape of live Paper snapshots: compound keys sorted (Java String order).
+        let inventory = r#"{held_item_slot:3,items:{items:[{DataVersion:5023,Slot:0,components:{"minecraft:damage":12,"minecraft:enchantments":{"minecraft:sharpness":5}},count:1,id:"minecraft:diamond_sword"},{DataVersion:5023,Slot:40,count:1,id:"minecraft:shield"},{DataVersion:5023,Slot:42,count:2,id:"minecraft:arrow"}],size:43}}"#;
+        let ender = r#"{items:[{DataVersion:5023,Slot:4,count:9,id:"minecraft:emerald"}],size:27}"#;
+        let health = r#"{health:20.0,health_scale:20.0,is_health_scaled:false}"#;
+        let json = format!(
+            concat!(
+                r#"{{"id":"0b6f2c9e-5d1a-4e7b-8c3f-9a2d4e6b1f70","pinned":false,"timestamp":"2026-11-11T09:30:15.25Z","#,
+                r#""save_cause":"DISCONNECT","server_name":"the lobby","minecraft_version":"26.3","platform_type":"bukkit","#,
+                r#""format_version":5,"data":{{"husksync:persistent_data":"{{}}","husksync:statistics":"{{}}","#,
+                r#""husksync:inventory":"{}","husksync:ender_chest":"{}","husksync:health":"{}","#,
+                r#""husksync:note":"a \u003cb\u003e \u0026 c \u003d \u0027d\u0027"}}}}"#
+            ),
+            inventory.replace('"', "\\\""),
+            ender.replace('"', "\\\""),
+            health.replace('"', "\\\""),
+        );
+        let s = Packed::from_bytes(json.as_bytes(), false).unwrap();
+        assert_eq!(s.to_json(), json);
+        assert_eq!(s.data.keys().next().map(String::as_str), Some("husksync:persistent_data"));
+        let compressed = s.to_bytes(true);
+        assert_eq!(Packed::from_bytes(&compressed, true).unwrap().to_json(), json);
+
+        let inv = crate::data::Inventory::deserialize(&s.data[keys::INVENTORY], 5023).unwrap();
+        assert_eq!(inv.slots.len(), 43);
+        assert_eq!(inv.serialize(), inventory);
+        let e = crate::data::EnderChest::deserialize(&s.data[keys::ENDER_CHEST], 5023).unwrap();
+        assert_eq!(e.slots.len(), 27);
+        assert_eq!(e.serialize(), ender);
+    }
+
+    #[test]
+    fn gson_escapes_match_gson() {
+        let mut s = Packed::new(&platform(), "API", false, IndexMap::new());
+        s.data.insert("husksync:x".into(), "<&>='".into());
+        assert!(s.to_json().contains(r#""husksync:x":"\u003c\u0026\u003e\u003d\u0027""#), "{}", s.to_json());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::data::{self, *};
 use crate::nbt::{parse_snbt, Nbt};
 use crate::records;
 use crate::snapshot::keys;
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 /// Horizon's own data version (`horizon_core::version::DATA_VERSION`, Minecraft 26.3).
 pub const DATA_VERSION: i32 = 5023;
@@ -34,8 +34,9 @@ fn strip_slot(item: &Nbt) -> Option<StoredItem> {
     Some(StoredItem { item, data_version })
 }
 
-/// The 41 slots of a vanilla player compound: `Inventory` (0..36; also the pre-1.21.5 armour
-/// slots 100..103 and off hand -106) and `equipment`.
+/// The slots of a vanilla player compound, as `INVENTORY_SLOTS` (43): `Inventory` (0..36; also the
+/// pre-1.21.5 armour slots 100..103 and off hand -106) and `equipment` fill 0..41. 41 and 42 stay
+/// empty: the vanilla compound has no such slots.
 pub fn inventory_slots(player: &Nbt) -> Vec<Option<StoredItem>> {
     let mut slots = vec![None; INVENTORY_SLOTS];
     if let Some(list) = player.get("Inventory").and_then(Nbt::as_list) {
@@ -107,9 +108,9 @@ pub fn effects(player: &Nbt) -> Vec<Effect> {
 
 /// What `UserDataHolder.getData` returns on Paper for this player, as snapshot strings: the
 /// enabled built-in types this port can read from the player compound.
-pub fn capture(player: &Nbt, config: &Config, dimension_hint: Option<&str>) -> BTreeMap<String, String> {
+pub fn capture(player: &Nbt, config: &Config, dimension_hint: Option<&str>) -> IndexMap<String, String> {
     let f = &config.synchronization.features;
-    let mut out = BTreeMap::new();
+    let mut out = IndexMap::new();
     if f.inventory {
         let inv = Inventory {
             slots: inventory_slots(player),
@@ -293,12 +294,23 @@ pub fn attributes_nbt(a: &Attributes, config: &Config) -> Nbt {
 /// carried over from the snapshot the player last received (advancements, statistics,
 /// attributes, other plugins' data...). Disabled built-in types are left out, as on Paper.
 pub fn merge_with_carried(
-    captured: BTreeMap<String, String>,
-    carried: Option<&BTreeMap<String, String>>,
+    captured: IndexMap<String, String>,
+    carried: Option<&IndexMap<String, String>>,
     config: &Config,
-) -> BTreeMap<String, String> {
+) -> IndexMap<String, String> {
     let mut out = captured;
     if let Some(carried) = carried {
+        // A type that did not change since it was applied keeps its stored text byte for byte:
+        // Paper's own order (Gson field order, Bukkit's criteria order) cannot be rebuilt, and a
+        // round trip must not rewrite data nobody touched.
+        for (k, v) in out.iter_mut() {
+            if let Some(old) = carried.get(k)
+                && old != v
+                && same_json(old, v)
+            {
+                *v = old.clone();
+            }
+        }
         for (k, v) in carried {
             if !out.contains_key(k) && config.synchronization.features.enabled(k) {
                 out.insert(k.clone(), v.clone());
@@ -306,6 +318,15 @@ pub fn merge_with_carried(
         }
     }
     out
+}
+
+/// Whether two stored values are the same data written in another order: JSON (objects compare
+/// without key order) or, failing that, the same text.
+fn same_json(a: &str, b: &str) -> bool {
+    match (serde_json::from_str::<serde_json::Value>(a), serde_json::from_str::<serde_json::Value>(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Horizon keeps the mods' persistent compound (`native_set_player_persistent_data`) in the
@@ -346,7 +367,7 @@ pub struct ApplyPlan {
 }
 
 /// `DataSnapshot.Unpacked` + `Data.apply` for the types this port applies.
-pub fn plan(data: &BTreeMap<String, String>, snapshot_mc_version: &str, config: &Config) -> ApplyPlan {
+pub fn plan(data: &IndexMap<String, String>, snapshot_mc_version: &str, config: &Config) -> ApplyPlan {
     let f = &config.synchronization.features;
     let fallback = crate::util::data_version_of(snapshot_mc_version);
     let mut p = ApplyPlan::default();
@@ -452,7 +473,7 @@ fn p_skip(key: &str, e: String) -> (String, String) {
 }
 
 /// `/userdata restore` and `/inventory` edits rewrite one type of a stored snapshot.
-pub fn set_health_at_least_one(data: &mut BTreeMap<String, String>) {
+pub fn set_health_at_least_one(data: &mut IndexMap<String, String>) {
     if let Some(s) = data.get(keys::HEALTH) {
         if let Ok(mut h) = data::from_json::<Health>(s) {
             h.health = h.health.max(1.0);
@@ -532,7 +553,7 @@ mod tests {
         assert!(p.skipped.is_empty());
         let (slots, held) = p.inventory.unwrap();
         assert_eq!(held, 8);
-        assert_eq!(slots.len(), 41);
+        assert_eq!(slots.len(), INVENTORY_SLOTS);
         assert_eq!(p.game_mode, Some(2));
         assert_eq!(p.health.unwrap().health, 17.5);
         assert_eq!(p.hunger.unwrap().food_level, 18);
@@ -566,7 +587,7 @@ mod tests {
     #[test]
     fn carried_types_survive_and_disabled_ones_do_not() {
         let c = config(false);
-        let mut carried = BTreeMap::new();
+        let mut carried = IndexMap::new();
         carried.insert(keys::ADVANCEMENTS.to_owned(), "[]".to_owned());
         carried.insert(keys::LOCATION.to_owned(), "{}".to_owned());
         carried.insert("other:thing".to_owned(), "x".to_owned());
@@ -580,7 +601,7 @@ mod tests {
 
     #[test]
     fn broken_types_are_skipped_not_fatal() {
-        let mut d = BTreeMap::new();
+        let mut d = IndexMap::new();
         d.insert(keys::HEALTH.to_owned(), "not json".to_owned());
         d.insert(keys::GAME_MODE.to_owned(), r#"{"game_mode":"CREATIVE"}"#.to_owned());
         let p = plan(&d, "26.3", &config(false));
@@ -605,5 +626,24 @@ mod tests {
         p.put("BukkitValues", old.clone());
         mod_data_as_bukkit_values(&mut p);
         assert_eq!(p.get("BukkitValues"), Some(&old));
+    }
+
+    #[test]
+    fn an_unchanged_type_keeps_its_stored_text() {
+        let cfg = Config::default();
+        let stored = r#"[{"key":"minecraft:story/root","completed_criteria":{"b":1,"a":2}}]"#;
+        let mut carried = IndexMap::new();
+        carried.insert(keys::ADVANCEMENTS.to_owned(), stored.to_owned());
+        let mut captured = IndexMap::new();
+        captured.insert(
+            keys::ADVANCEMENTS.to_owned(),
+            r#"[{"completed_criteria":{"a":2,"b":1},"key":"minecraft:story/root"}]"#.to_owned(),
+        );
+        let out = merge_with_carried(captured.clone(), Some(&carried), &cfg);
+        assert_eq!(out[keys::ADVANCEMENTS], stored);
+        // a real change is written as captured
+        captured.insert(keys::ADVANCEMENTS.to_owned(), r#"[{"key":"minecraft:story/root","completed_criteria":{"a":3}}]"#.to_owned());
+        let out = merge_with_carried(captured, Some(&carried), &cfg);
+        assert!(out[keys::ADVANCEMENTS].contains("\"a\":3"));
     }
 }

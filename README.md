@@ -1,6 +1,6 @@
 # HorizonSync
 
-HorizonSync -- player data sync for the Horizon server (https://github.com/horizon-rust/horizon, the
+HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
 Rust server for Minecraft 26.3). Players keep their inventory, ender chest, health, hunger, experience,
 effects, game mode, attributes and (optionally) location when they move between servers that share
 one MariaDB/MySQL database and one Redis.
@@ -12,9 +12,15 @@ cluster as Paper servers running HuskSync. The default table names (`husksync_us
 compatibility; the table names are configurable. HorizonSync includes code derived from HuskSync
 (Apache-2.0); see [NOTICE](NOTICE) and [LICENSE](LICENSE).
 
-**Status: written blind** (no engine build, no server run yet). The core crate builds and its unit
-tests pass; the engine glue and injections have not been compiled. See [STATUS.md](STATUS.md) and
-[GAPS.md](GAPS.md).
+> **Built for and working only with [arismoko/horizon](https://github.com/arismoko/horizon)** (the Horizon fork that carries the mod API). [horizon-rust/horizon](https://github.com/horizon-rust/horizon) is experimental for mods and not supported: the earlier version for its native hooks / horizon-mixins is frozen on the `horizon-plain` branch (work stopped on 2026-11-12).
+
+## Which Horizon
+
+This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `horizon-mod-api`, `src/lib.rs` with the hooks, and the plugin logic in the `core/` crate (plain Rust, no engine needed for its tests).
+
+- Pin: `[native] horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"` in `horizon-mod.toml` (game `26.3`). That is a development build of arismoko/horizon `main` plus mod API additions that are not all merged upstream yet, so a stock `main` may lack some host methods this mod calls until they land.
+- It compiled and loaded on that build and was smoke-tested there; it has not seen a long run with real players. Treat it as experimental.
+- Feature descriptions below were written for the earlier horizon-rust version; where they name engine calls (`native_*`) or old file paths, read them as descriptions only. The Known gaps list is current.
 
 ## What it does
 
@@ -78,24 +84,25 @@ Not supported: `database.type` `POSTGRES`/`MONGO`, Redis Sentinel, Redis over TL
 
 ## Build
 
-A horizon-mixins bundle (this folder): one crate (`core`, using only crates in Horizon's
-`Cargo.lock`: `mysql` 27 with `minimal-rust` + `rustls-tls-ring`, `redis` 1 without default features,
-`serde`, `serde_json`, `toml`, `chrono`, `log`), one support module (`glue/horizonsync.rs`, placed in
-`crates/horizon-client/src/game.rs` as `game::horizonsync`), and 21 HEAD injections (`helpers/`).
+Build it as a native trait mod with arismoko's launcher (see the "native mods" how-to in the arismoko/horizon docs):
 
 ```sh
-horizon-mixins apply --workspace <horizon source> --mods <folder containing this bundle> --out <stage>
-cd <stage> && cargo build --profile fast -p horizon-client --no-default-features --locked
+horizon-launcher native-build <path to this folder> --server-output <dir> --version <tag> --trust-native-code
 ```
 
-`horizon_revision` in `horizon-mixin.toml` pins the Horizon commit it was written against.
-Unit tests: `cargo test` in `core/` with Horizon's `Cargo.lock` copied next to it.
+`--trust-native-code` is your consent to compile and run this code inside the server. The logic crate tests run without the engine: `(cd core && cargo test)`.
+
+## Known gaps
+
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+
+- Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
+- The editable `/inventory` and `/enderchest` menus open read-only (the menu-close event carries no slots).
+- Locked players can still take damage and launch projectiles while their data loads.
+- The DISCONNECT snapshot depends on hook order and is not fully verified.
+- Snapshot compatibility with the Java HuskSync plugin has to be checked on your data before you trust it: keep backups.
 
 ## Licence
 
 Apache License 2.0, see [LICENSE](LICENSE) (the licence of HuskSync, from which this is derived by reading
 its source); the attribution is in [NOTICE](NOTICE).
-
-## Contributing
-
-Pull requests and improvements are always welcome! Open an issue or a PR -- direct pushes to main are disabled, every change goes through review.

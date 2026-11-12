@@ -9,6 +9,7 @@ pub mod config;
 pub mod data;
 pub mod db;
 pub mod engine;
+pub mod messages;
 pub mod nbt;
 pub mod player;
 pub mod records;
@@ -16,6 +17,7 @@ pub mod redis_mgr;
 pub mod snapshot;
 pub mod snappy;
 pub mod util;
+pub mod yaml;
 
 pub use data::StoredItem;
 pub use engine::{Action, Engine, MenuEdit, Sender};
@@ -34,15 +36,17 @@ fn engine() -> Option<&'static Arc<Engine>> {
     ENGINE.get()
 }
 
-/// The dedicated server starts: read `<config_dir>/horizonsync/config.toml` (written with the
-/// defaults when missing), connect to the database and Redis. `folder_name` names the server
+/// The dedicated server starts: read HuskSync's `plugins/HuskSync/config.yml` of the server folder
+/// (else `<config_dir>/horizonsync/config.toml`, written with the defaults when missing), connect to the database and Redis. `folder_name` names the server
 /// when the config leaves `server_name` empty. Errors are logged and leave the mod off.
 pub fn start(config_dir: &Path, folder_name: &str) {
     if ENGINE.get().is_some() {
         return;
     }
+    // The server's folder is the config folder's parent (`plugins/HuskSync` is read from there).
+    let server_dir = config_dir.parent().unwrap_or(config_dir);
     let dir = config_dir.join("horizonsync");
-    let mut config = match config::Config::load_or_create(&dir) {
+    let mut config = match config::Config::load(server_dir, &dir) {
         Ok(c) => c,
         Err(e) => {
             log::error!("horizonsync: not started: {e}");

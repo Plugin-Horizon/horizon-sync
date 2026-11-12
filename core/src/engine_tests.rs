@@ -7,7 +7,8 @@ use crate::nbt::parse_snbt;
 use crate::redis_mgr::{Message, MessageType};
 use crate::snapshot::{keys, Packed, Platform};
 use crate::util;
-use std::collections::{BTreeMap, HashMap};
+use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,7 +156,7 @@ fn platform() -> Platform {
 }
 
 fn snapshot(cause: &str, game_mode: &str, age_secs: i64) -> Packed {
-    let mut data = BTreeMap::new();
+    let mut data = IndexMap::new();
     data.insert(keys::GAME_MODE.into(), format!(r#"{{"game_mode":"{game_mode}"}}"#));
     data.insert(keys::ADVANCEMENTS.into(), "[]".into());
     let mut p = Packed::new(&platform(), cause, false, data);
@@ -199,8 +200,9 @@ fn new_user_is_registered_and_unlocked() {
     let (e, db, redis) = setup("LOCKSTEP");
     e.on_join(P, "Alex");
     assert!(e.is_locked(P));
+    // The notice comes from the locale texts, as an action bar line.
     let msg = run_until(&e, 3, |a| match a {
-        Action::Message { text, overlay: true, .. } => Some(text.clone()),
+        Action::Component { text, overlay: true, .. } => Some(text.clone()),
         _ => None,
     });
     assert_eq!(msg.as_deref(), Some("⭐ User registration complete!"));
@@ -296,7 +298,7 @@ fn a_snapshot_from_another_platform_fails_and_stays_locked() {
     db.add_snapshot(P, &s).unwrap();
     e.on_join(P, "Alex");
     let msg = run_until(&e, 3, |a| match a {
-        Action::Message { text, overlay: false, .. } => Some(text.clone()),
+        Action::Component { text, overlay: false, .. } => Some(text.clone()),
         _ => None,
     });
     assert!(msg.unwrap().contains("Failed to synchronize"));

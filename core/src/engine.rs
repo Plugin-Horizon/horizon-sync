@@ -14,7 +14,8 @@ use crate::player::{self, ApplyPlan};
 use crate::redis_mgr::{Message, MessageType, Redis};
 use crate::snapshot::{Packed, Platform};
 use crate::util;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -110,21 +111,20 @@ pub enum UpdateCause {
 }
 
 impl UpdateCause {
+    /// The `messages-<language>.yml` key of the success notice (`UpdateCause`'s texts in HuskSync).
     fn completed(self) -> &'static str {
         match self {
-            UpdateCause::Synchronized => "⏵ Data synchronized!",
-            UpdateCause::NewUser => "⭐ User registration complete!",
-            UpdateCause::Updated => "🔔 Your data has been updated!",
+            UpdateCause::Synchronized => "synchronization_complete",
+            UpdateCause::NewUser => "user_registration_complete",
+            UpdateCause::Updated => "data_update_complete",
         }
     }
 
     fn failed(self) -> Option<&'static str> {
         match self {
-            UpdateCause::Synchronized => {
-                Some("⏵ Failed to synchronize your data! Please contact an administrator.")
-            }
+            UpdateCause::Synchronized => Some("synchronization_failed"),
             UpdateCause::NewUser => None,
-            UpdateCause::Updated => Some("🔔 Failed to update your data! Please contact an administrator."),
+            UpdateCause::Updated => Some("data_update_failed"),
         }
     }
 }
@@ -140,7 +140,8 @@ pub enum Action {
     Message { player: Option<u128>, text: String, overlay: bool },
     /// A chat line with click and hover events: `json` is a text component (1.21.5+ field names,
     /// `click_event` / `hover_event`), `text` the same line as plain words.
-    Component { player: Option<u128>, text: String, json: serde_json::Value },
+    /// `overlay`: the action bar instead of chat.
+    Component { player: Option<u128>, text: String, json: serde_json::Value, overlay: bool },
     /// Show items in a chest menu (`/inventory`, `/enderchest`); with `edit` the viewer may take
     /// and put items, and the game calls [`Engine::on_menu_edited`] when the menu closes.
     OpenMenu { viewer: u128, title: String, rows: u8, items: Vec<Option<StoredItem>>, edit: Option<MenuEdit> },
@@ -159,13 +160,13 @@ struct Session {
     name: String,
     /// The data of the snapshot last applied: the types this port can't capture are carried
     /// from it into the player's next snapshot.
-    carried: Option<BTreeMap<String, String>>,
+    carried: Option<IndexMap<String, String>>,
     /// Bumped on each join, so work for an earlier visit is dropped.
     visit: u64,
 }
 
 enum Pending {
-    Apply { player: u128, visit: u64, cause: UpdateCause, data: BTreeMap<String, String> },
+    Apply { player: u128, visit: u64, cause: UpdateCause, data: IndexMap<String, String> },
     Capture(mpsc::Sender<Option<Nbt>>),
 }
 
@@ -270,7 +271,15 @@ impl Engine {
 
     /// A line with click and hover events (`plain` is what a log or a console shows).
     pub(crate) fn tell_component(&self, player: Option<u128>, plain: impl Into<String>, json: serde_json::Value) {
-        self.push(Action::Component { player, text: plain.into(), json });
+        self.push(Action::Component { player, text: plain.into(), json, overlay: false });
+    }
+
+    /// A notice from the locale file (`key`), one chat line (or action bar line) per line of it.
+    fn notice(&self, player: u128, key: &str, overlay: bool) {
+        let lines = self.cfg().messages.lines(key, &[]);
+        for line in lines {
+            self.push(Action::Component { player: Some(player), text: line.plain, json: line.component, overlay });
+        }
     }
 
     pub(crate) fn tell(&self, player: Option<u128>, text: impl Into<String>) {
@@ -504,14 +513,12 @@ impl Engine {
         if ok {
             self.unlock(player);
             match slot.as_str() {
-                "CHAT" => self.tell(Some(player), cause.completed()),
-                "ACTION_BAR" | "TOAST" => {
-                    self.push(Action::Message { player: Some(player), text: cause.completed().into(), overlay: true })
-                }
+                "CHAT" => self.notice(player, cause.completed(), false),
+                "ACTION_BAR" | "TOAST" => self.notice(player, cause.completed(), true),
                 _ => {}
             }
-        } else if let Some(text) = cause.failed() {
-            self.tell(Some(player), text);
+        } else if let Some(key) = cause.failed() {
+            self.notice(player, key, false);
         }
         let name = self.st().sessions.get(&player).map(|s| s.name.clone());
         if let Some(name) = name {
