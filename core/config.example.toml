@@ -1,0 +1,132 @@
+# HorizonSync: config/horizonsync/config.toml on the Horizon server. Only used when the server has no
+# plugins/HuskSync/config.yml: that file (HuskSync's own, with server.yml and messages-<language>.yml)
+# is read first. Key names follow HuskSync's config.yml (and server.yml's `name`). Every server of a
+# cluster must agree on cluster_id, the database, Redis, compress_data and the features.
+
+# This server's name, as the proxy calls it (HuskSync's server.yml). Empty: the folder name.
+server_name = ""
+language = "en-gb"
+cluster_id = ""
+debug_logging = false
+# Read for compatibility with HuskSync's config.yml; Horizon has no update checker, Plan hook or packet library.
+check_for_updates = true
+enable_plan_hook = true
+cancel_packets = true
+# Paper refuses snapshots from a newer Minecraft version or another platform type.
+minecraft_version = "26.3"
+platform_type = "bukkit"
+disabled_commands = []
+
+[database]
+# MYSQL or MARIADB.
+type = "MYSQL"
+host = "localhost"
+port = 3306
+database = "HuskSync"
+username = "root"
+# Empty on purpose: set the database password here (or read it from HuskSync's config.yml).
+password = ""
+use_ssl = false
+maximum_pool_size = 10
+minimum_idle = 10
+connection_timeout = 5000
+# Read for compatibility (HuskSync's connection_pool / credentials.parameters); not used here.
+maximum_lifetime = 1800000
+keepalive_time = 0
+parameters = "?autoReconnect=true&useSSL=false&useUnicode=true&characterEncoding=UTF-8"
+create_tables = true
+# The zone the `timestamp` column is written in: "local" (as a Paper JVM on this machine) or
+# a fixed offset such as "+01:00".
+timestamp_zone = "local"
+
+[database.table_names]
+users = "husksync_users"
+user_data = "husksync_user_data"
+map_data = "husksync_map_data"
+map_ids = "husksync_map_ids"
+
+[redis]
+host = "localhost"
+port = 6379
+user = ""
+password = ""
+database = 0
+use_ssl = false
+connection_timeout = 2000
+socket_timeout = 2000
+max_retries = 3
+retry_backoff_millis = 200
+# Read for compatibility (HuskSync's pool and health-check keys); not used here.
+max_total_connections = 50
+max_idle_connections = 8
+min_idle_connections = 2
+test_on_borrow = true
+test_on_return = true
+test_while_idle = true
+min_evictable_idle_time_millis = 60000
+time_between_eviction_runs_millis = 30000
+
+[redis.sentinel]
+# Not supported: a non-empty master is logged and ignored.
+master = ""
+nodes = []
+password = ""
+
+[synchronization]
+# LOCKSTEP or DELAY.
+mode = "LOCKSTEP"
+max_user_data_snapshots = 16
+snapshot_backup_frequency = 4
+auto_pinned_save_causes = ["INVENTORY_COMMAND", "ENDERCHEST_COMMAND", "BACKUP_RESTORE", "LEGACY_MIGRATION", "MPDB_MIGRATION"]
+save_on_world_save = true
+compress_data = true
+# ACTION_BAR, CHAT, TOAST (shown on the action bar) or NONE.
+notification_display_slot = "ACTION_BAR"
+persist_locked_maps = true
+network_latency_milliseconds = 500
+shutdown_save_timeout_milliseconds = 5000
+blacklisted_commands_while_locked = ["*"]
+allow_pearl_spawning_while_locked = true
+checkin_petitions = false
+
+[synchronization.save_on_death]
+enabled = false
+items_to_save = "DROPS"
+save_empty_items = true
+sync_dead_players_changing_server = true
+
+[synchronization.features]
+inventory = true
+ender_chest = true
+potion_effects = true
+advancements = true
+location = false
+statistics = true
+health = true
+hunger = true
+attributes = true
+experience = true
+game_mode = true
+flight_status = true
+persistent_data = true
+
+[synchronization.attributes]
+synced_attributes = ["minecraft:generic.max_health", "minecraft:max_health", "minecraft:generic.max_absorption", "minecraft:max_absorption", "minecraft:generic.luck", "minecraft:luck", "minecraft:generic.scale", "minecraft:scale", "minecraft:generic.step_height", "minecraft:step_height", "minecraft:generic.gravity", "minecraft:gravity"]
+ignored_modifiers = ["minecraft:effect.*", "minecraft:creative_mode_*"]
+
+# Bukkit's world names for husksync:location (Paper looks worlds up by name). uuid: the world's
+# uid.dat UUID on the Paper side, if known.
+[worlds."minecraft:overworld"]
+name = "world"
+uuid = ""
+environment = "NORMAL"
+
+[worlds."minecraft:the_nether"]
+name = "world_nether"
+uuid = ""
+environment = "NETHER"
+
+[worlds."minecraft:the_end"]
+name = "world_the_end"
+uuid = ""
+environment = "THE_END"
