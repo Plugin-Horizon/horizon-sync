@@ -721,7 +721,7 @@ mod yaml_tests {
         \x20 allow_pearl_spawning_while_locked: false\n  attributes:\n    synced_attributes:\n    - minecraft:generic.max_health\n\
         \x20   ignored_modifiers:\n    - minecraft:effect.*\n  event_priorities:\n    death_listener: NORMAL\n";
 
-    const SERVER_YML: &str = "# test fixture\nname: rec_test\n";
+    const SERVER_YML: &str = "# test fixture\nname: test_server\n";
 
     const MESSAGES_YML: &str = "locales:\n  synchronization_complete: <color:#123456>Synced %1%</color>\n  \
         data_update_failed: <red>Update failed</red>\n";
@@ -743,7 +743,7 @@ mod yaml_tests {
         std::fs::write(plugin.join("messages-en-gb.yml"), MESSAGES_YML).unwrap();
 
         let c = Config::from_huskysync(&plugin).unwrap();
-        assert_eq!(c.server_name, "rec_test");
+        assert_eq!(c.server_name, "test_server");
         assert_eq!(c.database.host, "db.test.invalid");
         assert_eq!(c.database.port, 3307);
         assert_eq!(c.database.username, "tester");
