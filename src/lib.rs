@@ -696,18 +696,22 @@ impl Hooks for Mod {
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // Each usage carries its sub-command's node (`horizonsync.command.userdata.save`, HuskSync's
-        // plugin.yml nodes) as Brigadier's requires on that literal: the tree hides what a player may not
-        // run, and the level decides only when no permissions mod answers. run_mod_command still asks the
-        // node (the `about` node and the `.edit` nodes are decided there).
+        // The public usages (`horizonsync`, `horizonsync about`) and the console-only ones (level 4) are open.
+        // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): the engine
+        // leaves it out of the tab list of a player without the node (as Bukkit hides a command whose node the
+        // sender lacks), and `player_command` answers the typed line with HuskSync's own denial.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
             let usage = usage.replace(":player_name>", ":word>");
-            let command = if level == 0 { Command::new(&usage) } else { Command::op(&usage, level) };
-            event.commands.push(match core::permission_for(&usage) {
-                Some((node, _)) => command.with_node(&node),
-                None => command,
-            });
+            if level == 0 || level >= 4 {
+                event.commands.push(Command::new(&usage));
+                continue;
+            }
+            let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
+            match core::permission_for(&literals.join(" ")) {
+                Some((node, _)) => event.commands.push(Command::op(&usage, level).with_node(&node)),
+                None => event.commands.push(Command::new(&usage)),
+            }
         }
     }
 
@@ -742,13 +746,46 @@ impl Hooks for Mod {
         // not, so the core answers the denial itself.
         let level = if granted { 4 } else { 0 };
         let sender = core::Sender { uuid, name, level, edit };
-        if core::perform_command(sender, &line) { Flow::Cancel } else { Flow::Continue }
+        if core::perform_command(sender, &line) {
+            return Flow::Cancel;
+        }
+        // Off (`enabled` not `true`): answer instead of "unknown command".
+        if !core::is_running() {
+            let _ = host.commands().feedback(Text::literal(
+                "HorizonSync is switched off on this server (enabled = false). Nothing was run.",
+            ));
+            return Flow::Cancel;
+        }
+        Flow::Continue
     }
 
-    fn player_command(&self, _: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
+    fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
         // Fields `player` and `command` follow the hook's documented arguments; not compiled yet.
         // blacklisted_commands_while_locked: a player whose data is loading may not run commands.
-        if core::refuse_command(event.player, event.command) { Flow::Cancel } else { Flow::Continue }
+        if core::refuse_command(event.player, event.command) {
+            return Flow::Cancel;
+        }
+        // An operator usage the player lacks the node for is hidden from their tree: answer HuskSync's denial
+        // here (also while the mod is off), not the engine's "unknown command". The console is never asked.
+        let line = event.command.trim_start_matches('/').to_owned();
+        let root = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let sub = line.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
+        if !labels().iter().any(|l| *l == root) || matches!(sub.as_str(), "forceupgrade" | "migrate") {
+            return Flow::Continue;
+        }
+        let Some((node, required)) = core::permission_for(&line) else {
+            return Flow::Continue;
+        };
+        if required == 0 {
+            return Flow::Continue;
+        }
+        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        if allowed {
+            return Flow::Continue;
+        }
+        event.cancelled = true;
+        event.replies.push(Text::literal("Error: You do not have permission to execute this command"));
+        Flow::Cancel
     }
 
     // ----- the lock while a player's data loads (BukkitLockedEventListener) -----

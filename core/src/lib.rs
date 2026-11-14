@@ -147,8 +147,14 @@ pub fn on_menu_edited(edit: MenuEdit, items: Vec<Option<StoredItem>>) {
 pub fn command_usages() -> Vec<(String, u8)> {
     match engine() {
         Some(e) => commands::usages(&e.cfg().disabled_commands),
-        None => Vec::new(),
+        // Off: the usages are still registered, so the glue can answer that the mod is off.
+        None => commands::usages(&[]),
     }
+}
+
+/// Whether the mod is running (the gate was on and the engine started).
+pub fn is_running() -> bool {
+    engine().is_some()
 }
 
 /// The permission node a command's registration names (`horizonsync.command.<command>`).
