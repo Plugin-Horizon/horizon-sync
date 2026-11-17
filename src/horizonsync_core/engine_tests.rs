@@ -1,12 +1,12 @@
 //! The sync rules against an in-memory database and Redis (no server, no network).
 
-use crate::config::Config;
-use crate::db::Stored;
-use crate::engine::{Action, Cache, Engine, Store};
-use crate::nbt::parse_snbt;
-use crate::redis_mgr::{Message, MessageType};
-use crate::snapshot::{keys, Packed, Platform};
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::db::Stored;
+use crate::horizonsync_core::engine::{Action, Cache, Engine, Store};
+use crate::horizonsync_core::nbt::parse_snbt;
+use crate::horizonsync_core::redis_mgr::{Message, MessageType};
+use crate::horizonsync_core::snapshot::{keys, Packed, Platform};
+use crate::horizonsync_core::util;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -334,7 +334,7 @@ fn server_stop_saves_everyone_unlocked_and_releases_checkouts() {
 
 #[test]
 fn locked_launch_rule_follows_husksync() {
-    use crate::engine::launch_refused;
+    use crate::horizonsync_core::engine::launch_refused;
     assert!(!launch_refused(false, "minecraft:snowball", false));
     assert!(launch_refused(true, "minecraft:snowball", true));
     assert!(!launch_refused(true, "minecraft:ender_pearl", true));

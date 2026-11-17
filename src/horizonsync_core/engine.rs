@@ -5,15 +5,15 @@
 //! `tick`...), the engine does the database and Redis work on worker threads, and hands back
 //! [`Action`]s for the game's thread: apply this plan, capture that player, show this line.
 
-use crate::config::Config;
-use crate::data::{self, EnderChest, Inventory, StoredItem};
-use crate::snapshot::keys;
-use crate::db::{usable, Db, Stored};
-use crate::nbt::Nbt;
-use crate::player::{self, ApplyPlan};
-use crate::redis_mgr::{Message, MessageType, Redis};
-use crate::snapshot::{Packed, Platform};
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::data::{self, EnderChest, Inventory, StoredItem};
+use crate::horizonsync_core::snapshot::keys;
+use crate::horizonsync_core::db::{usable, Db, Stored};
+use crate::horizonsync_core::nbt::Nbt;
+use crate::horizonsync_core::player::{self, ApplyPlan};
+use crate::horizonsync_core::redis_mgr::{Message, MessageType, Redis};
+use crate::horizonsync_core::snapshot::{Packed, Platform};
+use crate::horizonsync_core::util;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -810,7 +810,7 @@ impl Engine {
                 Ok(Some(s)) => s.snapshot,
                 _ => return me.tell(to, "Error: Could not find any user data to display."),
             };
-            let mut s = match crate::db::usable(latest, &me.platform) {
+            let mut s = match crate::horizonsync_core::db::usable(latest, &me.platform) {
                 Ok(s) => s.copy(),
                 Err(e) => return me.tell(to, format!("Error: {e}")),
             };

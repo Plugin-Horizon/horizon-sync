@@ -7,16 +7,19 @@
 //! `config/horizonsync/config.toml` the game writes points at `disabled.invalid` (no database, no
 //! Redis) until the operator sets the hosts. A plan with anything the engine cannot take (an item at
 //! another data version, an unreadable item or attribute) is refused whole, never applied in part.
+
+pub mod horizonsync_core;
 #[cfg(any())]
 mod legacy_glue;
 
 use horizonsync_core as core;
-use mod_api::{TriState, 
+use mod_api::{TriState,
     ArmorStandManipulateEvent, AttackEntityEvent, AttributeModifier, AttributeOperation, Identifier, ItemStack,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
     CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
-    EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, ItemPickedUpEvent, ItemTossEvent,
-    LeftClickBlockEvent, LivingRef, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
+    EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
+    LeftClickBlockEvent, LivingRef, MenuReplace, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
+    PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
@@ -147,12 +150,8 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    if let Some(json) = player.advancements(&*host) {
-        nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
-    }
-    if let Some(json) = player.statistics(&*host) {
-        nbt.put(core::records::RECORD_STATISTICS, core::Nbt::String(json));
-    }
+    // HMOD-GAP(player-advancements-statistics): Horizon main has no per-player advancement or statistics read
+    // (only `advancement(id)` lookups). The advancements and statistics are not read here, so they are not synced.
     if let Some(data) = player.persistent_data(&*host) {
         nbt.put("NeoForgeData", to_core(&Tag::Compound(data)));
     }
@@ -335,7 +334,35 @@ fn respawn(host: &mut dyn ServerHost, uuid: u128) -> bool {
     let Some(player) = host.player(uuid) else {
         return false;
     };
-    player.respawn(host)
+    player.respawn(host).is_ok()
+}
+
+/// A typed Boolean permission node, as the game's handler answers it.
+fn boolean_node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// Every node `core::permission_for` can name, with its default operator level: the group nodes (the bare
+/// command, the inventory and ender chest views), the sub-command nodes and the edit nodes. `about` is for everyone.
+fn permission_nodes() -> Vec<(String, u8)> {
+    let op = core::commands::OP;
+    let mut nodes: Vec<(String, u8)> = vec![
+        ("horizonsync.command.horizonsync".into(), op),
+        ("horizonsync.command.horizonsync.about".into(), 0),
+    ];
+    for sub in ["status", "reload", "update", "dump"] {
+        nodes.push((format!("horizonsync.command.horizonsync.{sub}"), op));
+    }
+    nodes.push(("horizonsync.command.userdata".into(), op));
+    for sub in ["view", "list", "delete", "save", "restore", "pin", "dump"] {
+        nodes.push((format!("horizonsync.command.userdata.{sub}"), op));
+    }
+    for group in ["inventory", "enderchest"] {
+        nodes.push((format!("horizonsync.command.{group}"), op));
+        // The edit nodes default to operator level 2, as the legacy glue asked them.
+        nodes.push((format!("horizonsync.command.{group}.edit"), op));
+    }
+    nodes
 }
 
 /// Carries out an apply plan on a player who is on, in HuskSync's dependency order. False when the
@@ -377,27 +404,17 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
             log(&format!("persistent data not applied for {uuid:032x}: not a compound"));
             return false;
         };
-        if !player.set_persistent_data(host, compound) {
+        if player.set_persistent_data(host, compound).is_err() {
             log(&format!("persistent data not applied for {uuid:032x}: refused by the engine"));
             return false;
         }
     }
-    if let Some(advancements) = &plan.advancements {
-        if !player.set_advancements(host, &advancements.to_string()) {
-            log(&format!("advancements not applied for {uuid:032x}: refused by the engine"));
-            return false;
-        }
-    }
-    if let Some(statistics) = &plan.statistics {
-        if !player.set_statistics(host, &statistics.to_string()) {
-            log(&format!("statistics not applied for {uuid:032x}: refused by the engine"));
-            return false;
-        }
-    }
+    // HMOD-GAP(player-advancements-statistics): Horizon main has no per-player advancement or statistics write.
+    // The plan's advancements and statistics are not applied; the mod loses that part of the sync.
     // Inventory (all 43 vanilla slots, empty ones cleared) and the held slot, then the ender chest.
     if let Some((stacks, held)) = inventory {
         for (slot, stack) in stacks.into_iter().enumerate() {
-            if !matches!(player.set_inventory_slot(host, slot as u32, stack), Ok(true)) {
+            if player.set_inventory_slot(host, slot as u32, stack).is_err() {
                 log(&format!("inventory slot {slot} not written for {uuid:032x}"));
             }
         }
@@ -405,7 +422,7 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
     }
     if let Some(stacks) = ender_chest {
         for (slot, stack) in stacks.into_iter().enumerate() {
-            if !matches!(player.set_ender_chest_slot(host, slot as u32, stack), Ok(true)) {
+            if player.set_ender_chest_slot(host, slot as u32, stack).is_err() {
                 log(&format!("ender chest slot {slot} not written for {uuid:032x}"));
             }
         }
@@ -685,13 +702,22 @@ impl Hooks for Mod {
                         .iter()
                         .map(|i| i.as_ref().and_then(|i| host.item_from_snbt(&i.item.to_snbt())))
                         .collect();
-                    if host.open_menu(viewer, rows.clamp(1, 6), Text::literal(title), stacks).is_err() {
+                    if host.open_menu(viewer, rows.clamp(1, 6), Text::literal(title), stacks, MenuReplace::CloseFirst).is_err() {
                         log(&format!("menu for {viewer:032x} not opened"));
                     } else if edit.is_some() {
                         show(host, viewer, Text::literal("View only on this server: changes are not saved."), false);
                     }
                 }
             }
+        }
+    }
+
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        for (node, level) in permission_nodes() {
+            let _ = event.nodes.add(
+                boolean_node(&node),
+                NodeDefault::Level(PermissionLevel::from_level(i32::from(level))),
+            );
         }
     }
 
@@ -709,7 +735,7 @@ impl Hooks for Mod {
             }
             let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
             match core::permission_for(&literals.join(" ")) {
-                Some((node, _)) => event.commands.push(Command::op(&usage, level).with_node(&node)),
+                Some((node, _)) => event.commands.push(Command::op(&usage, level).with_node(&boolean_node(&node))),
                 None => event.commands.push(Command::new(&usage)),
             }
         }
@@ -723,19 +749,19 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         let line = command_line(&*host, &event.command);
-        let Some((node, required)) = core::permission_for(&line) else {
+        let Some((node, _)) = core::permission_for(&line) else {
             return Flow::Continue;
         };
         let edit_node = core::edit_permission_for(&line);
         let (uuid, name, granted, edit) = match &event.source {
             CommandSource::Player { player, .. } => {
-                // The `about` node (level 0) is open to everyone unless a permissions mod says otherwise.
-                let granted = if required == 0 {
-                    player.permission_value(&*host, &node).unwrap_or(true)
-                } else {
-                    player.has_permission(&*host, &node)
+                // The node's default (`permission_gather_nodes`) decides unless the handler answers; `about`
+                // defaults to everyone. Any error is a denial.
+                let granted = player.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false);
+                let edit = match &edit_node {
+                    Some(n) => player.permission_bool(&mut *host, &boolean_node(n)).unwrap_or(false),
+                    None => false,
                 };
-                let edit = edit_node.as_deref().is_some_and(|n| player.has_permission(&*host, n));
                 (Some(player.uuid()), player.name(&*host).unwrap_or_default(), granted, edit)
             }
             CommandSource::Console { .. } => (None, "CONSOLE".to_string(), true, edit_node.is_some()),
@@ -779,7 +805,10 @@ impl Hooks for Mod {
         if required == 0 {
             return Flow::Continue;
         }
-        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        let allowed = match host.player(event.player) {
+            Some(p) => p.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false),
+            None => false,
+        };
         if allowed {
             return Flow::Continue;
         }
@@ -822,8 +851,14 @@ impl Hooks for Mod {
         acting_flow(&*host)
     }
 
-    fn entity_interact(&self, host: &mut dyn ServerHost, _: &mut EntityInteractEvent<'_>) -> Flow {
-        acting_flow(&*host)
+    fn entity_interact(&self, host: HostSide<'_>, _: &mut EntityInteractEvent<'_>) -> Option<InteractionResult> {
+        match host {
+            HostSide::Server(host) => match acting_flow(&*host) {
+                Flow::Cancel => Some(InteractionResult::Fail),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn armor_stand_manipulate(&self, host: &mut dyn ServerHost, _: &mut ArmorStandManipulateEvent<'_>) -> Flow {
@@ -841,7 +876,7 @@ impl Hooks for Mod {
         acting_flow(&*host)
     }
 
-    fn item_toss(&self, host: &mut dyn ServerHost, _: &mut ItemTossEvent<'_>) -> Flow {
+    fn item_toss(&self, host: &mut dyn ServerHost, _: &mut ItemTossEvent) -> Flow {
         acting_flow(&*host)
     }
 

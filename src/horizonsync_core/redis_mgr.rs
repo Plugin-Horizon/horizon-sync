@@ -8,9 +8,9 @@
 //! `husksync:::request_user_data`, `husksync:::return_user_data`, `husksync:::check_in_petition`.
 //! Messages are Gson JSON: `{"targetServer":..,"target_uuid":..,"payload":[signed bytes]}`.
 
-use crate::config::Config;
-use crate::snapshot::Packed;
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::snapshot::Packed;
+use crate::horizonsync_core::util;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

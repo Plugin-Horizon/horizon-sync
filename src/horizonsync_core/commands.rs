@@ -5,11 +5,11 @@
 //! (default level 2, as HuskSync's `Permission.Default.IF_OP`; `/horizonsync about` is for everyone).
 //! Operators pass unless a permissions mod denies the node.
 
-use crate::data::{EnderChest, Inventory};
-use crate::engine::{Action, Engine, Sender};
-use crate::player;
-use crate::snapshot::{cause_display, keys, Packed};
-use crate::util;
+use crate::horizonsync_core::data::{EnderChest, Inventory};
+use crate::horizonsync_core::engine::{Action, Engine, Sender};
+use crate::horizonsync_core::player;
+use crate::horizonsync_core::snapshot::{cause_display, keys, Packed};
+use crate::horizonsync_core::util;
 use std::sync::Arc;
 
 pub const OP: u8 = 2;
@@ -291,7 +291,7 @@ fn status_lines(engine: &Engine) -> Vec<String> {
 fn reload(engine: &Engine) -> Result<(), String> {
     // `engine.dir` is `<server>/config/horizonsync`: the server folder is two levels up.
     let server_dir = engine.dir.parent().and_then(|p| p.parent()).unwrap_or(&engine.dir);
-    let mut fresh = crate::config::Config::load(server_dir, &engine.dir)?;
+    let mut fresh = crate::horizonsync_core::config::Config::load(server_dir, &engine.dir)?;
     if fresh.server_name.trim().is_empty() {
         fresh.server_name = engine.platform.server_name.clone();
     }
@@ -384,7 +384,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
                 None => engine.db.latest_snapshot(player),
             };
             match stored {
-                Ok(Some(s)) => match crate::db::usable(s.snapshot, &engine.platform) {
+                Ok(Some(s)) => match crate::horizonsync_core::db::usable(s.snapshot, &engine.platform) {
                     Ok(s) => overview(engine, to, &s, &name, player),
                     Err(e) => invalid_data(engine, to, &e),
                 },
@@ -422,7 +422,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
                 Ok(None) => return engine.tell(to, "Error: Could not find any user data for that version UUID."),
                 Err(e) => return engine.tell(to, format!("Error: {e}")),
             };
-            let mut s = match crate::db::usable(stored.snapshot, &engine.platform) {
+            let mut s = match crate::horizonsync_core::db::usable(stored.snapshot, &engine.platform) {
                 Ok(s) => s.copy(),
                 Err(e) => return invalid_data(engine, to, &e),
             };
@@ -692,7 +692,7 @@ fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
             None => return engine.tell(to, "Error: Could not find any user data to display."),
         },
     };
-    let s = match crate::db::usable(snapshot, &engine.platform) {
+    let s = match crate::horizonsync_core::db::usable(snapshot, &engine.platform) {
         Ok(s) => s,
         Err(e) => return invalid_data(engine, to, &e),
     };
@@ -717,7 +717,7 @@ fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
     };
     engine.tell(to, format!("Viewing snapshot of {name}'s {what} as of ⌚ {}", time_medium(&s.timestamp)));
     // Only the player's latest data is editable, and only with the `.edit` permission.
-    let edit = (sender.edit && args.get(1).is_none()).then(|| crate::engine::MenuEdit {
+    let edit = (sender.edit && args.get(1).is_none()).then(|| crate::horizonsync_core::engine::MenuEdit {
         viewer,
         target: player,
         target_name: name.clone(),

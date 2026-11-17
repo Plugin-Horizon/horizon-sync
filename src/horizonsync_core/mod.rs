@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 /// The config written on first start.
-pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
+pub const DEFAULT_CONFIG: &str = include_str!("../../data/husksync/config.example.toml");
 
 static ENGINE: OnceLock<Arc<Engine>> = OnceLock::new();
 

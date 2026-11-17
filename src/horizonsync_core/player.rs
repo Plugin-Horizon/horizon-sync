@@ -5,11 +5,11 @@
 //! Horizon snapshot says what a Paper one would for the same player. Applying gives the engine a
 //! plan, in HuskSync's dependency order; the engine side (`glue/horizonsync.rs`) carries it out.
 
-use crate::config::Config;
-use crate::data::{self, *};
-use crate::nbt::{parse_snbt, Nbt};
-use crate::records;
-use crate::snapshot::keys;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::data::{self, *};
+use crate::horizonsync_core::nbt::{parse_snbt, Nbt};
+use crate::horizonsync_core::records;
+use crate::horizonsync_core::snapshot::keys;
 use indexmap::IndexMap;
 
 /// Horizon's own data version (`horizon_core::version::DATA_VERSION`, Minecraft 26.3).
@@ -369,7 +369,7 @@ pub struct ApplyPlan {
 /// `DataSnapshot.Unpacked` + `Data.apply` for the types this port applies.
 pub fn plan(data: &IndexMap<String, String>, snapshot_mc_version: &str, config: &Config) -> ApplyPlan {
     let f = &config.synchronization.features;
-    let fallback = crate::util::data_version_of(snapshot_mc_version);
+    let fallback = crate::horizonsync_core::util::data_version_of(snapshot_mc_version);
     let mut p = ApplyPlan::default();
     let fail = |k: &str, e: String| p_skip(k, e);
     let mut skipped = Vec::new();

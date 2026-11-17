@@ -1,8 +1,8 @@
 //! HuskSync's `plugins/HuskSync/config.yml` (with `server.yml`), read as it is; `config/horizonsync/
 //! config.toml` is the fallback when that file is missing. Same key names, same defaults.
 
-use crate::messages::Messages;
-use crate::yaml;
+use crate::horizonsync_core::messages::Messages;
+use crate::horizonsync_core::yaml;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -478,7 +478,7 @@ impl Config {
         let file = dir.join("config.toml");
         if !file.exists() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            std::fs::write(&file, crate::DEFAULT_CONFIG).map_err(|e| e.to_string())?;
+            std::fs::write(&file, crate::horizonsync_core::DEFAULT_CONFIG).map_err(|e| e.to_string())?;
         }
         let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
         let text = flatten_huskysync_layout(&text).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -486,14 +486,14 @@ impl Config {
     }
 
     /// The Bukkit world for a dimension id, and back.
-    pub fn world_for(&self, dimension: &str) -> crate::data::World {
+    pub fn world_for(&self, dimension: &str) -> crate::horizonsync_core::data::World {
         match self.worlds.get(dimension) {
-            Some(w) => crate::data::World {
+            Some(w) => crate::horizonsync_core::data::World {
                 name: w.name.clone(),
                 uuid: if w.uuid.is_empty() { placeholder_uuid(&w.name) } else { w.uuid.clone() },
                 environment: if w.environment.is_empty() { "NORMAL".into() } else { w.environment.clone() },
             },
-            None => crate::data::World {
+            None => crate::horizonsync_core::data::World {
                 name: dimension.rsplit(':').next().unwrap_or(dimension).to_owned(),
                 uuid: placeholder_uuid(dimension),
                 environment: "CUSTOM".into(),
@@ -501,7 +501,7 @@ impl Config {
         }
     }
 
-    pub fn dimension_for(&self, world: &crate::data::World) -> Option<String> {
+    pub fn dimension_for(&self, world: &crate::horizonsync_core::data::World) -> Option<String> {
         self.worlds
             .iter()
             .find(|(_, w)| w.name == world.name || (!w.uuid.is_empty() && w.uuid == world.uuid))
@@ -657,7 +657,7 @@ fn placeholder_uuid(name: &str) -> String {
         h ^= b as u128;
         h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
     }
-    crate::util::uuid_string(h)
+    crate::horizonsync_core::util::uuid_string(h)
 }
 
 #[cfg(test)]
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn default_file_parses_and_matches_defaults() {
-        let c: Config = toml::from_str(crate::DEFAULT_CONFIG).unwrap();
+        let c: Config = toml::from_str(crate::horizonsync_core::DEFAULT_CONFIG).unwrap();
         assert!(c.synchronization.lockstep());
         assert!(c.synchronization.auto_pin("INVENTORY_COMMAND"));
         assert!(!c.synchronization.features.location);

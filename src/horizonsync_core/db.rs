@@ -4,9 +4,9 @@
 //! `husksync_user_data(version_uuid, player_uuid, timestamp datetime, save_cause varchar(32),
 //! pinned boolean, data longblob)`; maps tables are created but not used by this port.
 
-use crate::config::{Config, Database as DbConfig};
-use crate::snapshot::{Packed, Platform};
-use crate::util;
+use crate::horizonsync_core::config::{Config, Database as DbConfig};
+use crate::horizonsync_core::snapshot::{Packed, Platform};
+use crate::horizonsync_core::util;
 use mysql::prelude::Queryable;
 use mysql::{OptsBuilder, Pool, PoolConstraints, PoolOpts, Row, Value};
 use std::time::Duration;
@@ -20,7 +20,7 @@ pub struct Stored {
 
 pub struct Db {
     pool: Pool,
-    t: crate::config::TableNames,
+    t: crate::horizonsync_core::config::TableNames,
     zone: Zone,
     compress: bool,
     max_snapshots: i64,
@@ -63,7 +63,7 @@ impl Zone {
 }
 
 /// The schema, as `mariadb_schema.sql` (MySQL gets the same statements).
-fn schema(t: &crate::config::TableNames) -> Vec<String> {
+fn schema(t: &crate::horizonsync_core::config::TableNames) -> Vec<String> {
     let s = [
         "SET DEFAULT_STORAGE_ENGINE = INNODB",
         "SET FOREIGN_KEY_CHECKS = 1",
@@ -114,7 +114,7 @@ fn schema(t: &crate::config::TableNames) -> Vec<String> {
 }
 
 /// `formatStatementTables`.
-fn tables(q: &str, t: &crate::config::TableNames) -> String {
+fn tables(q: &str, t: &crate::horizonsync_core::config::TableNames) -> String {
     q.replace("%users_table%", &t.users)
         .replace("%user_data_table%", &t.user_data)
         .replace("%map_data_table%", &t.map_data)
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn statements_use_configured_tables() {
-        let t = crate::config::TableNames::default();
+        let t = crate::horizonsync_core::config::TableNames::default();
         let s = schema(&t);
         assert!(s[2].contains("CREATE TABLE IF NOT EXISTS `husksync_users`"));
         assert!(s[4].contains("REFERENCES `husksync_users` (`uuid`)"));

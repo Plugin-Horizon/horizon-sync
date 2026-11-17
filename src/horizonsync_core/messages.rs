@@ -14,7 +14,7 @@
 //! than `show_text`, and click actions other than the four above. Legacy `&` codes are plain text.
 //! A real newline inside a block scalar (`|-`) becomes a space, as YAML folds it.
 
-use crate::yaml;
+use crate::horizonsync_core::yaml;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;

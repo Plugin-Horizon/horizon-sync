@@ -3,7 +3,7 @@
 //!
 //! Items are SNBT (NBT-API's `itemStackArrayToNBT`); everything else is Gson JSON.
 
-use crate::nbt::{parse_snbt, Nbt};
+use crate::horizonsync_core::nbt::{parse_snbt, Nbt};
 use serde::{Deserialize, Serialize};
 
 /// The slots HuskSync's inventory holds as Paper writes it: `size:43` in every live snapshot.
