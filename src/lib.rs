@@ -204,7 +204,7 @@ fn read_statistics(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
         };
         for key in keys {
             let id = key.to_string();
-            let count = host.player_stat(player, kind, &id).unwrap_or(0);
+            let count = player.stat(&*host, kind, &id).unwrap_or(0);
             if count > 0 {
                 found.push((category, id, count));
             }
@@ -595,11 +595,11 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
     // snapshot does not list keeps its count, as Bukkit's `setStatistic` loop does.
     if let Some(stats) = &plan.statistics {
         for (kind, key, count) in statistic_updates(stats) {
-            if !host.player_reset_stat(player, kind, &key) {
+            if !player.reset_stat(host, kind, &key) {
                 log(&format!("statistic {key} not written for {uuid:032x}"));
                 continue;
             }
-            if count > 0 && !host.player_award_stat(player, kind, &key, count) {
+            if count > 0 && !player.award_stat(host, kind, &key, count) {
                 log(&format!("statistic {key} not awarded for {uuid:032x}"));
             }
         }
