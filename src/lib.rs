@@ -405,11 +405,13 @@ fn finite_or(v: f32, or: f32) -> f32 {
     if v.is_finite() { v } else { or }
 }
 
-/// Whether the player is in the world but dead (`LivingEntity.isAlive` is false).
+/// Whether the player is in the world but dead (`LivingEntity.isAlive` is false) and the health data
+/// type is on: HuskSync only waits for the respawn then (`user.isDead() && Identifier.HEALTH.isEnabled()`).
 fn is_dead(host: &dyn ServerHost, uuid: u128) -> bool {
-    host
-        .player(uuid)
-        .is_some_and(|p| LivingRef::new(p.entity()).alive(host) == Some(false))
+    core::feature_enabled("husksync:health")
+        && host
+            .player(uuid)
+            .is_some_and(|p| LivingRef::new(p.entity()).alive(host) == Some(false))
 }
 
 /// Respawns a dead player as their own Respawn click would (`player_respawn`). False when the
