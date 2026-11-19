@@ -316,6 +316,10 @@ fn locked_players_cannot_run_commands_and_world_save_skips_them() {
     redis.checkout.lock().unwrap().insert(P, "paper".into());
     e.on_join(P, "Alex");
     assert!(e.refuse_command(P, "spawn"));
+    // The game tells the engine who is on each tick; a locked player's entity takes no damage.
+    e.tick(&[(P, 7), (P + 1, 8)]);
+    assert!(e.is_locked_entity(7));
+    assert!(!e.is_locked_entity(8));
     e.on_world_save(vec![(P, parse_snbt("{}").unwrap())]);
     std::thread::sleep(Duration::from_millis(200));
     assert!(db.sorted(P).is_empty());

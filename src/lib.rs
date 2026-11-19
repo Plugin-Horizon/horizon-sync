@@ -18,7 +18,8 @@ use mod_api::{TriState,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
     CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
     EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
-    GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LivingDropsEvent, LivingRef,
+    GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LevelRandomHost,
+    LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
@@ -1174,10 +1175,17 @@ impl Hooks for Mod {
         acting_flow(&*host)
     }
 
-    // TODO(arismoko-api: living_incoming_damage victim): locked players can still take damage; the
-    // damage hook names the victim as an entity, and mapping it to a player needs more than the hook gives.
-    // TODO(arismoko-api: projectile_launch_cancel): a locked player's ender pearl or arrow is not refused
-    // (player_launch_projectile only listens).
+    // A locked player takes no damage (`BukkitLockedEventListener.onPlayerTakeDamage`). The core keeps the
+    // entity ids of the locked players (`tick`).
+    fn living_incoming_damage(&self, _: &mut dyn LevelRandomHost, event: &mut LivingIncomingDamageEvent<'_>) -> Flow {
+        if event.kind == "minecraft:player" && core::is_locked_entity(event.entity) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    // HMOD-GAP(locked-projectile-cancel): `player_launch_projectile` and `projectile_launch` only listen, after the
+    // projectile exists; removing it would also lose the thrown item, which HuskSync's cancel gives back. A locked
+    // player's ender pearl or arrow is not refused (`core::refuse_launch` is ready for a cancelling hook).
+    // HMOD-GAP(locked-inventory-click): no hook answers a click in the player's own inventory screen, which
+    // `BukkitLockedEventListener.onInventoryClick` cancels; only `container_opened` is refused.
 }
 
 #[cfg(test)]
