@@ -18,7 +18,7 @@ use mod_api::{TriState,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
     CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
     EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
-    LeftClickBlockEvent, LivingRef, MenuReplace, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
+    GameRuleValue, LeftClickBlockEvent, LivingDropsEvent, LivingRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
@@ -361,6 +361,18 @@ fn permission_nodes() -> Vec<(String, u8)> {
         nodes.push((format!("husksync.command.{group}.edit"), op));
     }
     nodes
+}
+
+/// Item stacks as the core stores them: the vanilla item compound at the server's data version. A stack
+/// the game cannot write as a compound is left out.
+fn stored_items<'a>(host: &dyn ServerHost, stacks: impl Iterator<Item = &'a ItemStack>) -> Vec<core::StoredItem> {
+    let version = host.server_data_version();
+    stacks
+        .filter_map(|stack| {
+            let compound = stack.to_nbt(host)?;
+            Some(core::StoredItem { item: to_core(&Tag::Compound(compound)), data_version: version })
+        })
+        .collect()
 }
 
 /// Carries out an apply plan on a player who is on, in HuskSync's dependency order. False when the
@@ -823,6 +835,45 @@ impl Hooks for Mod {
             event.replies.push(text);
         }
         Flow::Cancel
+    }
+
+    // Save on death (HuskSync's `saveOnPlayerDeath`) with `items_to_save: DROPS`: the stacks the player
+    // drops. A locked player drops nothing (`cancelPlayerEvent` clears the drops).
+    fn living_drops(&self, host: &mut dyn ServerHost, event: &mut LivingDropsEvent<'_>) -> Flow {
+        let Some(player) = event.player else {
+            return Flow::Continue;
+        };
+        if !core::running() {
+            return Flow::Continue;
+        }
+        if core::is_locked(player) {
+            event.drops.clear();
+            return Flow::Continue;
+        }
+        if core::death_saves_kept_items() {
+            return Flow::Continue;
+        }
+        let items = stored_items(&*host, event.drops.iter().map(|drop| &drop.stack));
+        if let Some(nbt) = read_player(host, player) {
+            core::on_death(player, &nbt, items);
+        }
+        Flow::Continue
+    }
+
+    // `items_to_save: ITEMS_TO_KEEP`: what the player keeps, which is the whole inventory when
+    // `keep_inventory` is on and nothing otherwise (Paper's `getItemsToKeep`). The inventory is still
+    // intact where `ServerPlayer.die` starts.
+    fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
+        if !core::running() || !core::death_saves_kept_items() {
+            return;
+        }
+        let Some(nbt) = read_player(host, event.player) else {
+            return;
+        };
+        let keep = matches!(host.game_rule("keep_inventory"), Ok(GameRuleValue::Bool(true)));
+        let items: Vec<core::StoredItem> =
+            if keep { core::player::inventory_slots(&nbt).into_iter().flatten().collect() } else { Vec::new() };
+        core::on_death(event.player, &nbt, items);
     }
 
     // ----- the lock while a player's data loads (BukkitLockedEventListener) -----

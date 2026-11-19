@@ -101,6 +101,8 @@ const SHUTDOWN_CRITICAL_CAUSES: [&str; 2] = ["SERVER_SHUTDOWN", "DISCONNECT"];
 const SHUTDOWN_CRITICAL_DB_ATTEMPTS: u32 = 3;
 const SHUTDOWN_CRITICAL_DB_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const TICK: Duration = Duration::from_millis(50);
+/// `BukkitData.Items.Inventory.INVENTORY_SLOT_COUNT`: a death snapshot keeps at most this many stacks.
+const DEATH_INVENTORY_SLOTS: usize = 41;
 
 /// `DataSnapshot.UpdateCause`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,6 +687,28 @@ impl Engine {
             let s = self.snapshot_of(player, &compound, "WORLD_SAVE");
             self.save_current(player, s, None);
         }
+    }
+
+    /// `EventListener.saveOnPlayerDeath`: a DEATH snapshot of the player's data with `items` (what they
+    /// dropped, or what they keep, as `items_to_save` says) as the inventory's contents. Not put to
+    /// Redis: the state is not one the player will be in after respawning. Nothing when the setting is
+    /// off, the player is locked, or there is nothing to save and `save_empty_items` is off.
+    pub fn on_death(self: &Arc<Self>, player: u128, compound: &Nbt, items: Vec<StoredItem>) {
+        let settings = self.cfg().synchronization.save_on_death.clone();
+        if self.is_locked(player) || !settings.enabled || (!settings.save_empty_items && items.is_empty()) {
+            return;
+        }
+        let mut snapshot = self.snapshot_of(player, compound, "DEATH");
+        if let Some(old) = snapshot.data.get(keys::INVENTORY) {
+            let fallback = util::data_version_of(&snapshot.minecraft_version);
+            // `setContents` replaces the stacks and keeps the held slot.
+            let held = Inventory::deserialize(old, fallback).map_or(0, |i| i.held_item_slot);
+            let mut slots: Vec<Option<StoredItem>> =
+                items.into_iter().take(DEATH_INVENTORY_SLOTS).map(Some).collect();
+            slots.resize(data::INVENTORY_SLOTS, None);
+            snapshot.data.insert(keys::INVENTORY.to_owned(), Inventory { slots, held_item_slot: held }.serialize());
+        }
+        self.spawn(true, move |me| me.persist(player, &snapshot));
     }
 
     /// `EventListener.handlePluginDisable`: SERVER_SHUTDOWN saves for everyone still unlocked,

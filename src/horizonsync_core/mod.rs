@@ -84,6 +84,24 @@ pub fn on_leave(player: u128, compound: &Nbt) {
     }
 }
 
+/// A player died with `items` (their drops, or the stacks they keep) and `compound` as their data
+/// (`PlayerDeathEvent`): the DEATH snapshot, when `save_on_death` is on.
+pub fn on_death(player: u128, compound: &Nbt, items: Vec<StoredItem>) {
+    if let Some(e) = engine() {
+        e.on_death(player, compound, items);
+    }
+}
+
+/// What `save_on_death.items_to_save` says to save: true for `ITEMS_TO_KEEP`, false for `DROPS`.
+pub fn death_saves_kept_items() -> bool {
+    engine().is_some_and(|e| e.cfg().synchronization.save_on_death.items_to_save.eq_ignore_ascii_case("ITEMS_TO_KEEP"))
+}
+
+/// Whether the built-in data type `key` (`husksync:statistics`) is synchronised.
+pub fn feature_enabled(key: &str) -> bool {
+    engine().is_some_and(|e| e.cfg().synchronization.features.enabled(key))
+}
+
 /// The world saved (`WorldSaveEvent`): every player here with their compound.
 pub fn on_world_save(players: Vec<(u128, Nbt)>) {
     if let Some(e) = engine() {
