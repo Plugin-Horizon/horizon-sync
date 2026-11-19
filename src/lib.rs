@@ -18,7 +18,8 @@ use mod_api::{TriState,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
     CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
     EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
-    GameRuleValue, LeftClickBlockEvent, LivingDropsEvent, LivingRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
+    GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LivingDropsEvent, LivingRef,
+    MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
@@ -73,8 +74,22 @@ struct Deferred {
     waited: u32,
 }
 
+/// An open `/inventory` or `/enderchest` menu its viewer may edit: the clicks are carried out here (the
+/// menu itself moves nothing) and the contents are saved when it closes.
+struct EditMenu {
+    viewer: u128,
+    window: i32,
+    edit: core::MenuEdit,
+    rows: u8,
+    /// The menu's own slots as the core stores them, as of the last click that changed them.
+    items: Vec<Option<core::StoredItem>>,
+    /// Whether a click changed anything: a menu only looked at saves nothing.
+    changed: bool,
+}
+
 #[derive(Default)]
 struct Mod {
+    edit_menus: Mutex<Vec<EditMenu>>,
     deferred: Mutex<Vec<Deferred>>,
     /// Players read at `player_save_to_file` this tick, for the leave snapshot in `player_logged_out`
     /// (the leave's save comes first, with the player still readable). Emptied every tick start, so
@@ -431,6 +446,90 @@ fn permission_nodes() -> Vec<(String, u8)> {
     nodes
 }
 
+/// The menu's own slots (the first `rows * 9`) as the core stores them.
+fn menu_items(host: &mut dyn ServerHost, menu: MenuRef, rows: u8) -> Vec<Option<core::StoredItem>> {
+    let version = host.server_data_version();
+    let mut out = Vec::new();
+    for slot in 0..usize::from(rows) * 9 {
+        let stack = ItemPlace::MenuSlot { menu, slot }.stack(host);
+        out.push(stack.and_then(|stack| {
+            let compound = stack.to_nbt(&*host)?;
+            Some(core::StoredItem { item: to_core(&Tag::Compound(compound)), data_version: version })
+        }));
+    }
+    out
+}
+
+/// A click in an editable menu, as vanilla's `doClick` does it for the two kinds that move items: a left or
+/// right click that picks a stack up, puts the cursor's down or swaps them (a right click takes half or
+/// puts one), and a shift-click that sends a stack from the menu's own slots (the first `own`) to the
+/// viewer's inventory part and the other way. Everything in one transaction, so a click that cannot be
+/// carried out whole changes nothing. Drags, number keys, throws and double clicks do nothing. True when
+/// something moved.
+fn edit_click(host: &mut dyn ServerHost, menu: MenuRef, own: usize, slot: usize, button: i32, mode: i32) -> bool {
+    let place = ItemPlace::MenuSlot { menu, slot };
+    let cursor = menu.cursor();
+    let moved: Result<(), ()> = host.transaction(|host, tx| {
+        let here = place.stack(host);
+        if mode == 1 {
+            let Some(stack) = here else { return Err(()) };
+            let resource = ItemResource::of(&stack);
+            let targets = if slot < own { own..own + 36 } else { 0..own };
+            let mut left = stack.count();
+            for target in targets {
+                if left == 0 {
+                    break;
+                }
+                left -= ItemPlace::MenuSlot { menu, slot: target }.insert(host, tx, &resource, left).min(left);
+            }
+            let sent = stack.count() - left;
+            return if sent > 0 && place.extract(host, tx, &resource, sent) == sent { Ok(()) } else { Err(()) };
+        }
+        let held = cursor.stack(host);
+        match (held, here) {
+            (None, None) => Err(()),
+            // Pick up: all of the slot's stack, or half of it (rounded up) on a right click.
+            (None, Some(stack)) => {
+                let take = if button == 1 { stack.count().div_ceil(2) } else { stack.count() };
+                let resource = ItemResource::of(&stack);
+                let ok = place.extract(host, tx, &resource, take) == take && cursor.insert(host, tx, &resource, take) == take;
+                if ok { Ok(()) } else { Err(()) }
+            }
+            // Put down onto an empty slot or the same stack: all of the cursor's, or one on a right click.
+            (Some(carried), None) => put_down(host, tx, &place, &cursor, &carried, button),
+            (Some(carried), Some(stack)) if carried.same_item(&stack) && carried.same_components(&stack) => {
+                put_down(host, tx, &place, &cursor, &carried, button)
+            }
+            // Another stack: swap.
+            (Some(carried), Some(stack)) => {
+                let (carried_resource, resource) = (ItemResource::of(&carried), ItemResource::of(&stack));
+                let (carried_count, count) = (carried.count(), stack.count());
+                let ok = place.extract(host, tx, &resource, count) == count
+                    && cursor.extract(host, tx, &carried_resource, carried_count) == carried_count
+                    && place.insert(host, tx, &carried_resource, carried_count) == carried_count
+                    && cursor.insert(host, tx, &resource, count) == count;
+                if ok { Ok(()) } else { Err(()) }
+            }
+        }
+    });
+    moved.is_ok()
+}
+
+/// Moves the cursor's stack (or one of it on a right click) into the slot as far as the slot takes it.
+fn put_down(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    place: &ItemPlace,
+    cursor: &ItemPlace,
+    carried: &ItemStack,
+    button: i32,
+) -> Result<(), ()> {
+    let resource = ItemResource::of(carried);
+    let put = if button == 1 { 1 } else { carried.count() };
+    let placed = place.insert(host, tx, &resource, put);
+    if placed > 0 && cursor.extract(host, tx, &resource, placed) == placed { Ok(()) } else { Err(()) }
+}
+
 /// Item stacks as the core stores them: the vanilla item compound at the server's data version. A stack
 /// the game cannot write as a compound is left out.
 fn stored_items<'a>(host: &dyn ServerHost, stacks: impl Iterator<Item = &'a ItemStack>) -> Vec<core::StoredItem> {
@@ -785,20 +884,75 @@ impl Hooks for Mod {
                     show(host, p, line, overlay);
                 }
                 core::Action::Component { player: None, text, .. } => log(&text),
-                // The /inventory and /enderchest views as a native chest menu (`item_from_snbt`). Native
-                // menus move nothing, so an editable one opens read-only: an edit cannot be taken back
-                // (TODO(arismoko-api: menu_input_closed), menu_closed carries no slots).
+                // The /inventory and /enderchest views as a native chest menu (`item_from_snbt`). A menu its viewer
+                // may edit is remembered: `menu_clicked` carries the clicks out, `menu_closed` saves the contents.
                 core::Action::OpenMenu { viewer, title, rows, items, edit } => {
+                    let rows = rows.clamp(1, 6);
                     let stacks: Vec<Option<ItemStack>> = items
                         .iter()
                         .map(|i| i.as_ref().and_then(|i| host.item_from_snbt(&i.item.to_snbt())))
                         .collect();
-                    if host.open_menu(viewer, rows.clamp(1, 6), Text::literal(title), stacks, MenuReplace::CloseFirst).is_err() {
-                        log(&format!("menu for {viewer:032x} not opened"));
-                    } else if edit.is_some() {
-                        show(host, viewer, Text::literal("View only on this server: changes are not saved."), false);
+                    match host.open_menu(viewer, rows, Text::literal(title), stacks, MenuReplace::CloseFirst) {
+                        Ok(Some(window)) => {
+                            if let Some(edit) = edit {
+                                self.edit_menus.lock().unwrap_or_else(|e| e.into_inner()).push(EditMenu {
+                                    viewer,
+                                    window,
+                                    edit,
+                                    rows,
+                                    items,
+                                    changed: false,
+                                });
+                            }
+                        }
+                        Ok(None) | Err(_) => log(&format!("menu for {viewer:032x} not opened")),
                     }
                 }
+            }
+        }
+    }
+
+    // The clicks of an editable `/inventory` or `/enderchest` menu (`InventoryCommand` lets its viewer
+    // take and put items); the menu moves nothing itself, so they are carried out here.
+    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+        if !matches!(event.mode, 0 | 1) || !matches!(event.button, 0 | 1) || event.slot < 0 {
+            return;
+        }
+        let rows = {
+            let menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+            match menus.iter().find(|m| m.viewer == event.uuid && m.window == event.window) {
+                Some(m) => m.rows,
+                None => return,
+            }
+        };
+        let own = usize::from(rows) * 9;
+        let slot = event.slot as usize;
+        if slot >= own + 36 {
+            return;
+        }
+        let Some(menu) = host.menu(event.uuid, event.window) else {
+            return;
+        };
+        if !edit_click(host, menu, own, slot, event.button, event.mode) {
+            return;
+        }
+        let items = menu_items(host, menu, rows);
+        let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = menus.iter_mut().find(|m| m.viewer == event.uuid && m.window == event.window) {
+            m.items = items;
+            m.changed = true;
+        }
+    }
+
+    // The viewer closed an editable menu (or it was replaced, or they left): the new contents become a snapshot.
+    fn menu_closed(&self, _: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+        let closed = {
+            let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+            menus.iter().position(|m| m.viewer == event.uuid && m.window == event.window).map(|i| menus.remove(i))
+        };
+        if let Some(menu) = closed {
+            if menu.changed {
+                core::on_menu_edited(menu.edit, menu.items);
             }
         }
     }
@@ -1024,8 +1178,6 @@ impl Hooks for Mod {
     // damage hook names the victim as an entity, and mapping it to a player needs more than the hook gives.
     // TODO(arismoko-api: projectile_launch_cancel): a locked player's ender pearl or arrow is not refused
     // (player_launch_projectile only listens).
-    // TODO(arismoko-api: menu_input_closed): the editable /inventory and /enderchest menus; menu_closed
-    // carries no slots, so an edit cannot be taken (the menu opens read-only, see Action::OpenMenu).
 }
 
 #[cfg(test)]
