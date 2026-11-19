@@ -23,7 +23,7 @@ use mod_api::{TriState,
     PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
+    StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
 };
 use std::sync::Mutex;
 
@@ -150,13 +150,81 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    // HMOD-GAP(player-advancements-statistics): Horizon main has no per-player advancement or statistics read
-    // (only `advancement(id)` lookups). The advancements and statistics are not read here, so they are not synced.
+    // HMOD-GAP(player-advancements): Horizon main has no per-player advancement read (only `advancement(id)`
+    // lookups), so the advancements are not read here and not synced; a snapshot carries them over.
+    if core::feature_enabled("husksync:statistics") {
+        if let Some(json) = read_statistics(&*host, player) {
+            nbt.put(core::records::RECORD_STATISTICS, core::Nbt::String(json));
+        }
+    }
     if let Some(data) = player.persistent_data(&*host) {
         nbt.put("NeoForgeData", to_core(&Tag::Compound(data)));
     }
     core::player::mod_data_as_bukkit_values(&mut nbt);
     Some(nbt)
+}
+
+/// The statistic types HuskSync syncs: vanilla's category name, the type and the registry that lists the keys.
+const STAT_CATEGORIES: [(&str, StatType, &str); 9] = [
+    ("minecraft:mined", StatType::Mined, "minecraft:block"),
+    ("minecraft:crafted", StatType::Crafted, "minecraft:item"),
+    ("minecraft:used", StatType::Used, "minecraft:item"),
+    ("minecraft:broken", StatType::Broken, "minecraft:item"),
+    ("minecraft:picked_up", StatType::PickedUp, "minecraft:item"),
+    ("minecraft:dropped", StatType::Dropped, "minecraft:item"),
+    ("minecraft:killed", StatType::Killed, "minecraft:entity_type"),
+    ("minecraft:killed_by", StatType::KilledBy, "minecraft:entity_type"),
+    ("minecraft:custom", StatType::Custom, "minecraft:custom_stat"),
+];
+
+/// The player's statistics as vanilla's `stats/<uuid>.json` says them (`{"stats":{"minecraft:mined":
+/// {"minecraft:stone":5}}}`, counts above zero only): every key of every registry is asked, as the game
+/// has no list of what a player has counted.
+fn read_statistics(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
+    let mut found: Vec<(&str, String, i32)> = Vec::new();
+    for (category, kind, registry) in STAT_CATEGORIES {
+        let Some(keys) = host.registry_entries(registry) else {
+            continue;
+        };
+        for key in keys {
+            let id = key.to_string();
+            let count = host.player_stat(player, kind, &id).unwrap_or(0);
+            if count > 0 {
+                found.push((category, id, count));
+            }
+        }
+    }
+    Some(statistics_document(&found))
+}
+
+/// The `stats/<uuid>.json` text of counted statistics (category, key, count).
+fn statistics_document(found: &[(&str, String, i32)]) -> String {
+    let mut stats = serde_json::Map::new();
+    for (category, key, count) in found {
+        let entry = stats.entry((*category).to_owned()).or_insert_with(|| serde_json::json!({}));
+        entry[key.as_str()] = serde_json::json!(count);
+    }
+    serde_json::json!({ "stats": stats }).to_string()
+}
+
+/// A plan's statistics (`{"stats":{category:{key:count}}}`) as (type, key, count) to set. A category the
+/// game does not have, a key that is not a name and a count that is negative or too big are left out.
+fn statistic_updates(plan: &serde_json::Value) -> Vec<(StatType, String, i32)> {
+    let mut out = Vec::new();
+    let Some(categories) = plan.get("stats").and_then(|s| s.as_object()) else {
+        return out;
+    };
+    for (category, counts) in categories {
+        let Some((_, kind, _)) = STAT_CATEGORIES.iter().find(|(name, _, _)| name == category) else {
+            continue;
+        };
+        for (key, count) in counts.as_object().into_iter().flatten() {
+            if let Some(count) = count.as_i64().and_then(|c| i32::try_from(c).ok()).filter(|c| *c >= 0) {
+                out.push((*kind, key.clone(), count));
+            }
+        }
+    }
+    out
 }
 
 /// Binary NBT (big-endian, Java's file form) as the core's NBT, one tag of type `id`.
@@ -419,8 +487,21 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
             return false;
         }
     }
-    // HMOD-GAP(player-advancements-statistics): Horizon main has no per-player advancement or statistics write.
-    // The plan's advancements and statistics are not applied; the mod loses that part of the sync.
+    // HMOD-GAP(player-advancements): Horizon main has no per-player advancement write. The plan's
+    // advancements are not applied; the mod loses that part of the sync.
+    // Statistics: each saved count replaces the player's (`Player.resetStat`, then `awardStat`); a statistic the
+    // snapshot does not list keeps its count, as Bukkit's `setStatistic` loop does.
+    if let Some(stats) = &plan.statistics {
+        for (kind, key, count) in statistic_updates(stats) {
+            if !host.player_reset_stat(player, kind, &key) {
+                log(&format!("statistic {key} not written for {uuid:032x}"));
+                continue;
+            }
+            if count > 0 && !host.player_award_stat(player, kind, &key, count) {
+                log(&format!("statistic {key} not awarded for {uuid:032x}"));
+            }
+        }
+    }
     // Inventory (all 43 vanilla slots, empty ones cleared) and the held slot, then the ender chest.
     if let Some((stacks, held)) = inventory {
         for (slot, stack) in stacks.into_iter().enumerate() {
@@ -945,4 +1026,37 @@ impl Hooks for Mod {
     // (player_launch_projectile only listens).
     // TODO(arismoko-api: menu_input_closed): the editable /inventory and /enderchest menus; menu_closed
     // carries no slots, so an edit cannot be taken (the menu opens read-only, see Action::OpenMenu).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statistics_become_the_vanilla_document_and_back() {
+        let doc = statistics_document(&[
+            ("minecraft:mined", "minecraft:stone".into(), 5),
+            ("minecraft:custom", "minecraft:jump".into(), 3),
+            ("minecraft:mined", "minecraft:dirt".into(), 1),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(v["stats"]["minecraft:mined"]["minecraft:stone"], 5);
+        assert_eq!(v["stats"]["minecraft:mined"]["minecraft:dirt"], 1);
+        assert_eq!(v["stats"]["minecraft:custom"]["minecraft:jump"], 3);
+        assert_eq!(statistics_document(&[]), r#"{"stats":{}}"#);
+        let updates = statistic_updates(&v);
+        assert_eq!(updates.len(), 3);
+        assert!(updates.contains(&(StatType::Custom, "minecraft:jump".to_owned(), 3)));
+        assert!(updates.contains(&(StatType::Mined, "minecraft:stone".to_owned(), 5)));
+    }
+
+    #[test]
+    fn updates_skip_what_the_game_cannot_take() {
+        let plan = serde_json::json!({ "stats": {
+            "minecraft:used": { "minecraft:bread": 2, "minecraft:neg": -1, "minecraft:huge": 99999999999i64 },
+            "minecraft:unknown": { "minecraft:x": 1 }
+        }, "DataVersion": 5023 });
+        assert_eq!(statistic_updates(&plan), vec![(StatType::Used, "minecraft:bread".to_owned(), 2)]);
+        assert!(statistic_updates(&serde_json::json!({})).is_empty());
+    }
 }
