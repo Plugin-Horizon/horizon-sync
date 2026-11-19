@@ -8,7 +8,8 @@ source (https://github.com/WiIIiam278/HuskSync, commit 827f7be): the snapshot JS
 type serializations, the MySQL/MariaDB schema and statements, the Redis keys, channels and message
 format, the LOCKSTEP and DELAY synchronisation rules, the locked-player rules, the commands, the
 en-gb message texts and the config keys and defaults. Changes: rewritten in Rust for the Horizon
-game server; messages are plain text (no MiniMessage); no HuskSync source file is included. Database
+game server; messages are a MiniMessage subset; `data/husksync/messages-en-gb.yml` is HuskSync's
+`locales/en-gb.yml`, included unchanged; no HuskSync source file is included. Database
 statements and the SQL schema are reproduced from HuskSync's `MySqlDatabase.java` and
 `mariadb_schema.sql`.
 

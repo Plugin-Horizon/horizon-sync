@@ -1,15 +1,17 @@
-//! HuskSync's commands: `/horizonsync`, `/userdata` (alias `/playerdata`), `/inventory`
+//! HuskSync's commands: `/husksync`, `/userdata` (alias `/playerdata`), `/inventory`
 //! (`/openinv`; `/invsee` is left to InvSee++) and `/enderchest` (`/echest`, `/openechest`).
 //!
-//! Permission nodes (`horizonsync.command.*`) are checked by the glue with `native_has_permission`
-//! (default level 2, as HuskSync's `Permission.Default.IF_OP`; `/horizonsync about` is for everyone).
-//! Operators pass unless a permissions mod denies the node.
+//! Permission nodes (`husksync.command.*`) are checked by the glue with the typed node query
+//! (default level 2, as HuskSync's `Permission.Default.IF_OP`; `/husksync` and `/husksync about` are for
+//! everyone, as `Permission.Default.TRUE`). Every text of a command comes from the locale file.
 
 use crate::horizonsync_core::data::{EnderChest, Inventory};
 use crate::horizonsync_core::engine::{Action, Engine, Sender};
 use crate::horizonsync_core::player;
+use crate::horizonsync_core::messages::Messages;
 use crate::horizonsync_core::snapshot::{cause_display, keys, Packed};
 use crate::horizonsync_core::util;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub const OP: u8 = 2;
@@ -25,7 +27,7 @@ pub fn usages(disabled: &[String]) -> Vec<(String, u8)> {
             out.push((if r.is_empty() { name.to_owned() } else { format!("{name} {r}") }, *level));
         }
     };
-    let horizonsync: &[(&str, u8)] = &[
+    let husksync: &[(&str, u8)] = &[
         ("", 0),
         ("about", 0),
         ("status", OP),
@@ -36,9 +38,11 @@ pub fn usages(disabled: &[String]) -> Vec<(String, u8)> {
         // Console only in HuskSync: hidden from players.
         ("forceupgrade", 4),
         ("migrate", 4),
+        ("migrate help <migrator:word>", 4),
+        ("migrate start <migrator:word>", 4),
+        ("migrate set <migrator:word> <args:text>", 4),
     ];
-    add("horizonsync", horizonsync);
-    add("hsync", horizonsync);
+    add("husksync", husksync);
     let userdata: &[(&str, u8)] = &[
         ("view <username:player_name> [version:word]", OP),
         ("list <username:player_name> [page:integer]", OP),
@@ -59,10 +63,10 @@ pub fn usages(disabled: &[String]) -> Vec<(String, u8)> {
     out
 }
 
-/// The command group a label belongs to (`horizonsync.command.<group>`), aliases included.
+/// The command group a label belongs to (`husksync.command.<group>`), aliases included.
 fn group(label: &str) -> Option<&'static str> {
     match label {
-        "horizonsync" | "hsync" => Some("horizonsync"),
+        "husksync" => Some("husksync"),
         "userdata" | "playerdata" => Some("userdata"),
         "inventory" | "openinv" => Some("inventory"),
         "enderchest" | "echest" | "openechest" => Some("enderchest"),
@@ -72,34 +76,35 @@ fn group(label: &str) -> Option<&'static str> {
 
 /// The node a command is registered with: the first usage's node decides for the whole tree.
 pub fn command_node(label: &str) -> Option<String> {
-    group(&label.to_lowercase()).map(|g| format!("horizonsync.command.{g}"))
+    group(&label.to_lowercase()).map(|g| format!("husksync.command.{g}"))
 }
 
-/// The node a command line needs and its default level (HuskSync's `plugin.yml` nodes: a
-/// sub-command has its own node, `horizonsync.command.userdata.save`; `about` is for everyone).
+/// The node a command line needs and its default level (HuskSync's nodes: a sub-command has its own
+/// node, `husksync.command.userdata.save`; the bare `/husksync` and `about` use the command's own node,
+/// which is for everyone).
 pub fn permission_for(line: &str) -> Option<(String, u8)> {
     let mut words = line.trim().trim_start_matches('/').split_whitespace();
     let group = group(&words.next()?.to_lowercase())?;
     let sub = words.next().map(|w| w.to_lowercase());
     let known: &[&str] = match group {
-        "horizonsync" => &["about", "status", "reload", "update", "dump"],
+        "husksync" => &["status", "reload", "update", "dump"],
         "userdata" => &["view", "list", "delete", "save", "restore", "pin", "dump"],
         _ => &[],
     };
-    let level = if group == "horizonsync" && matches!(sub.as_deref(), None | Some("about")) { 0 } else { OP };
+    let level = if group == "husksync" && !matches!(sub.as_deref(), Some(s) if known.contains(&s)) { 0 } else { OP };
     let node = match sub.as_deref() {
-        Some(s) if known.contains(&s) => format!("horizonsync.command.{group}.{s}"),
-        _ => format!("horizonsync.command.{group}"),
+        Some(s) if known.contains(&s) => format!("husksync.command.{group}.{s}"),
+        _ => format!("husksync.command.{group}"),
     };
     Some((node, level))
 }
 
 /// The node that lets a viewer edit the items of `/inventory` or `/enderchest` (None for any other
-/// command): `horizonsync.command.inventory.edit`, `horizonsync.command.enderchest.edit`.
+/// command): `husksync.command.inventory.edit`, `husksync.command.enderchest.edit`.
 pub fn edit_permission_for(line: &str) -> Option<String> {
     let first = line.trim().trim_start_matches('/').split_whitespace().next()?.to_lowercase();
     let group = group(&first)?;
-    matches!(group, "inventory" | "enderchest").then(|| format!("horizonsync.command.{group}.edit"))
+    matches!(group, "inventory" | "enderchest").then(|| format!("husksync.command.{group}.edit"))
 }
 
 enum Kind {
@@ -116,7 +121,7 @@ pub fn perform(engine: &Arc<Engine>, sender: Sender, line: &str) -> bool {
         return false;
     }
     match label.as_str() {
-        "horizonsync" | "hsync" => horizonsync(engine, &sender, &args),
+        "husksync" => husksync(engine, &sender, &args),
         "userdata" | "playerdata" => {
             if !op(engine, &sender) {
                 return true;
@@ -139,104 +144,224 @@ pub fn perform(engine: &Arc<Engine>, sender: Sender, line: &str) -> bool {
 
 fn op(engine: &Engine, sender: &Sender) -> bool {
     if sender.uuid.is_some() && sender.level < OP {
-        engine.tell(sender.uuid, "Error: You do not have permission to execute this command");
+        engine.say(sender.uuid, "error_no_permission", &[]);
         return false;
     }
     true
 }
 
-fn horizonsync(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
+/// One text of the locale file as plain words (HuskSync's `getRawLocale` for a short word).
+fn word(engine: &Engine, key: &str, args: &[&str]) -> String {
+    engine.cfg().messages.lines(key, args).into_iter().map(|l| l.plain).collect::<Vec<_>>().join(" ")
+}
+
+/// A text that is not in the locale file (HuskSync builds these in code), as MiniMessage.
+fn say_mini(engine: &Engine, to: Option<u128>, mini: &str) {
+    engine.say_lines(to, Messages::render(mini));
+}
+
+fn husksync(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
     let to = sender.uuid;
     match args.first().map(|s| s.to_lowercase()).as_deref() {
         None | Some("about") => {
-            for line in about_lines() {
-                engine.tell(to, line);
+            for (plain, json) in about_lines() {
+                engine.tell_component(to, plain, json);
             }
         }
         // Console only (HuskSync's `setCondition(isConsole)`).
         Some("forceupgrade" | "migrate") if to.is_some() => {
-            engine.tell(to, "Error: That command can only be run through console");
+            engine.say(to, "error_console_command_only", &[]);
         }
         Some("forceupgrade") => {
             // `plugin.getLegacyConverter()` is empty without the v2 converter: HuskSync returns silently.
             log::info!("horizonsync: forceupgrade: the legacy (v2) converter is not part of the Horizon port");
         }
-        Some("migrate") => {
-            // No migrators (MPDB, legacy) are ported: the list HuskSync would print is empty.
-            engine.tell(
-                None,
-                "Please choose a migrator, then run \"horizonsync migrate start <migrator>\"\n\
-                 List of available migrators:\nMigrator ID / Migrator Name:",
-            );
-        }
+        Some("migrate") => match args.get(1).map(|s| s.to_lowercase()).as_deref() {
+            None => {
+                // No migrators (MPDB, legacy) are ported: the list HuskSync would print is empty.
+                engine.tell(
+                    None,
+                    "Please choose a migrator, then run \"husksync migrate start <migrator>\"\n\
+                     List of available migrators:\nMigrator ID / Migrator Name:",
+                );
+            }
+            // The migrator argument fails to parse when no migrator has that name.
+            Some("help" | "start" | "set") => {
+                engine.tell(None, "Unknown or incomplete command: no migrators are available on Horizon.");
+            }
+            Some(_) => {
+                engine.tell(None, "Unknown or incomplete command: use help, start or set.");
+            }
+        },
         // Denied: `op` has told the sender already.
         Some("status" | "reload" | "update" | "dump") if !op(engine, sender) => {}
         Some("status") => {
             let engine2 = engine.clone();
             engine.run_job(move |_| {
-                engine2.tell(to, "HorizonSync | System status report:");
-                for line in status_lines(&engine2) {
-                    engine2.tell(to, line);
+                engine2.say(to, "system_status_header", &[]);
+                for (plain, json) in status_lines(&engine2) {
+                    engine2.tell_component(to, plain, json);
                 }
             });
         }
         Some("reload") => match reload(engine) {
-            Ok(()) => {
-                engine.tell(to, "HorizonSync | Reloaded config and message files.");
-                engine.tell(to, "⚠ Ensure config files are up-to-date on all servers!");
-                engine.tell(to, "A restart is needed for config changes to take effect.");
-            }
+            Ok(()) => engine.say(to, "reload_complete", &[]),
             Err(e) => {
                 log::error!("horizonsync: failed to reload the plugin: {e}");
-                engine.tell(to, "Error: Failed to reload the plugin. Check console for errors.");
+                say_mini(
+                    engine,
+                    to,
+                    "<red>Error:</red> <gold>Failed to reload the plugin. Check console for errors.</gold>",
+                );
             }
         },
         Some("update") => {
-            // No update checker on Horizon (HuskSync asks Modrinth/Hangar).
-            engine.tell(to, "HorizonSync | Update checks are not part of the Horizon port.");
+            // No update checker on Horizon (HuskSync asks Modrinth/Hangar): `up_to_date` would be a guess.
+            say_mini(
+                engine,
+                to,
+                "<bold><color:#00fb9a>HuskSync</color></bold> <color:#00fb9a>| Update checks are not part of the Horizon port.</color>",
+            );
         }
         Some("dump") => match args.get(1).map(|s| s.to_lowercase()).as_deref() {
-            None => {
-                for line in [
-                    "HorizonSync | Prepare a system dump? This will include:",
-                    "• Your latest server logs and HorizonSync config files",
-                    "• Current plugin system status information",
-                    "• Information about your Java & Minecraft server environment",
-                    "• A list of other currently installed plugins",
-                    "To confirm, use: /horizonsync dump confirm",
-                ] {
-                    engine.tell(to, line);
-                }
-            }
+            None => engine.say(to, "system_dump_confirm", &[]),
             Some("confirm") => {
-                engine.tell(to, "HorizonSync | Preparing system status dump, please wait…");
+                engine.say(to, "system_dump_started", &[]);
                 // The dump service (mc-logs) upload is not ported; nothing leaves the server.
-                engine.tell(to, "Error: System status dumps are not available on Horizon.");
+                say_mini(
+                    engine,
+                    to,
+                    "<color:#ff3300>Error:</color> <color:#ff7e5e>System status dumps are not available on Horizon.</color>",
+                );
             }
-            Some(_) => usage(engine, to, "/horizonsync dump [confirm]"),
+            Some(_) => usage(engine, to, "/husksync dump [confirm]"),
         },
-        Some(_) => {
-            engine.tell(to, "Error: Incorrect syntax. Usage: /horizonsync <about|status|reload|update|dump>");
-        }
+        Some(_) => usage(engine, to, "/husksync <about|status|reload|update|dump>"),
     }
 }
 
-/// The `/horizonsync about` text.
-fn about_lines() -> Vec<String> {
+/// One text part for a component line: its words, colour (name or `#rrggbb`), bold and underline,
+/// hover text and click.
+fn part(text: &str, color: Option<&str>, bold: bool, underlined: bool, hover: Option<(&str, &str)>, click: Option<(&str, &str)>) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("text".into(), json!(text));
+    if let Some(c) = color {
+        m.insert("color".into(), json!(c));
+    }
+    if bold {
+        m.insert("bold".into(), json!(true));
+    }
+    if underlined {
+        m.insert("underlined".into(), json!(true));
+    }
+    if let Some((text, color)) = hover {
+        m.insert("hover_event".into(), json!({ "action": "show_text", "value": { "text": text, "color": color } }));
+    }
+    if let Some((action, value)) = click {
+        let field = if action == "open_url" { "url" } else { "command" };
+        m.insert("click_event".into(), json!({ "action": action, field: value }));
+    }
+    Value::Object(m)
+}
+
+/// A line of parts: its plain words and the component.
+fn line_of(parts: Vec<(String, Value)>) -> (String, Value) {
+    let plain: String = parts.iter().map(|(t, _)| t.as_str()).collect();
+    let extra: Vec<Value> = parts.into_iter().map(|(_, v)| v).collect();
+    (plain, json!({ "text": "", "extra": extra }))
+}
+
+/// The `/husksync about` menu (`HuskSyncCommand.buildAboutMenu`), line by line.
+fn about_lines() -> Vec<(String, Value)> {
+    const PRIMARY: &str = "#00fb9a";
+    const GRAY: &str = "#808080";
+    let credit = |name: &str, what: &str| (name.to_owned(), part(name, Some("gray"), false, false, Some((what, GRAY)), None));
+    let credits = |title: &str, list: Vec<(String, Value)>| {
+        let mut parts = vec![(format!("{title}: "), part(&format!("{title}: "), Some(PRIMARY), true, false, None, None))];
+        for (i, (name, v)) in list.into_iter().enumerate() {
+            if i > 0 {
+                parts.push((", ".into(), part(", ", None, false, false, None, None)));
+            }
+            parts.push((name, v));
+        }
+        line_of(parts)
+    };
+    let link = |text: &str, url: &str, color: &str| {
+        (text.to_owned(), part(text, Some(color), false, true, Some(("Click to open link", GRAY)), Some(("open_url", url))))
+    };
+    let author = ("William278".to_owned(), part("William278", Some(PRIMARY), false, false, Some(("Click to visit website", GRAY)), Some(("open_url", "https://william278.net"))));
+    let version = format!(" v{}", env!("CARGO_PKG_VERSION"));
+    let blank = || (String::new(), json!({ "text": "" }));
     vec![
-        format!("HorizonSync v{}", env!("CARGO_PKG_VERSION")),
-        "Player data sync for the Horizon server: inventory, ender chest, health and more follow a player across servers.".into(),
-        String::new(),
-        "Compatible with the HuskSync data format (database and Redis), so Horizon and Paper servers can share one cluster.".into(),
-        "Derived from HuskSync by William278 and contributors (Apache License 2.0); see NOTICE.".into(),
+        line_of(vec![
+            ("HuskSync".into(), part("HuskSync", Some(PRIMARY), true, false, None, None)),
+            (version.clone(), part(&version, Some("gray"), false, false, None, None)),
+        ]),
+        line_of(vec![(
+            "A modern, cross-server player data synchronization system".into(),
+            part("A modern, cross-server player data synchronization system", Some(GRAY), false, false, None, None),
+        )]),
+        blank(),
+        credits("Author", vec![author]),
+        credits("Maintainers", vec![credit("DaUltraMarine", "Code")]),
+        credits(
+            "Contributors",
+            vec![
+                credit("CatTeaA", "Code"),
+                credit("HarvelsX", "Code"),
+                credit("HookWoods", "Code"),
+                credit("mfnalex", "Code"),
+                credit("MrPippi", "Code"),
+                credit("Preva1l", "Code"),
+                credit("quiquelhappy", "Code"),
+                credit("hanbings", "Code (Fabric porting)"),
+                credit("Stampede2011", "Code (Fabric mixins)"),
+                credit("VinerDream", "Code"),
+                credit("WaterArchery", "Code"),
+            ],
+        ),
+        credits(
+            "Translators",
+            vec![
+                credit("Namiu", "Japanese (ja-jp)"),
+                credit("anchelthe", "Spanish (es-es)"),
+                credit("Melonzio", "Spanish (es-es)"),
+                credit("Ceddix", "German (de-de)"),
+                credit("Pukejoy_1", "Bulgarian (bg-bg)"),
+                credit("mateusneresrb", "Brazilian Portuguese (pt-br)"),
+                credit("小蔡", "Traditional Chinese (zh-tw)"),
+                credit("Ghost-chu", "Simplified Chinese (zh-cn)"),
+                credit("DJelly4K", "Simplified Chinese (zh-cn)"),
+                credit("Thourgard", "Ukrainian (uk-ua)"),
+                credit("xF3d3", "Italian (it-it)"),
+                credit("cada3141", "Korean (ko-kr)"),
+                credit("Wirayuda5620", "Indonesian (id-id)"),
+                credit("WinTone01", "Turkish (tr-tr)"),
+                credit("IbanEtchep", "French (fr-fr)"),
+                credit("Ris", "Hungarian (hu-hu)"),
+                credit("Antonioo", "Polish (pl-pl)"),
+            ],
+        ),
+        blank(),
+        line_of(vec![
+            link("⛏ Documentation", "https://william278.net/docs/husksync", "gray"),
+            ("  ".into(), part("  ", Some("gray"), false, false, None, None)),
+            link("❌ Issues", "https://github.com/WiIIiam278/HuskSync/issues", "#ff9f0f"),
+            ("  ".into(), part("  ", Some("gray"), false, false, None, None)),
+            link("⭐ Discord", "https://discord.gg/tVYhJfyDWG", "#6773f5"),
+        ]),
     ]
 }
 
-/// `StatusLine`: "• Name: value", names as `WordUtils.capitalizeFully(name().replace('_', ' '))`.
-fn status_lines(engine: &Engine) -> Vec<String> {
+/// `StatusLine`: "• Name: value", names as `WordUtils.capitalizeFully(name().replace('_', ' '))`, in
+/// `StatusLine`'s colours (grey names, green yes and enabled, red no and disabled).
+fn status_lines(engine: &Engine) -> Vec<(String, Value)> {
+    const GREEN: &str = "green";
+    const RED: &str = "red";
     let cfg = engine.cfg();
-    let yes = |b: bool| if b { "Yes" } else { "No" };
+    let yes = |b: bool| vec![(if b { "Yes" } else { "No" }.to_owned(), Some(if b { GREEN } else { RED }))];
     let local = |h: &str| yes(matches!(h, "127.0.0.1" | "0.0.0.0" | "localhost" | "::1"));
+    let plain = |s: String| vec![(s, None)];
     let ms = |r: Result<std::time::Duration, String>| match r {
         Ok(d) => format!("{}ms", d.as_millis()),
         Err(e) => format!("error ({e})"),
@@ -248,45 +373,58 @@ fn status_lines(engine: &Engine) -> Vec<String> {
         "MYSQL" => "MySQL".to_owned(),
         other => other.to_owned(),
     };
-    let types = [
+    let mut types: Vec<(String, Option<&str>)> = Vec::new();
+    for k in [
         "inventory", "ender_chest", "potion_effects", "advancements", "location", "statistics", "health",
         "hunger", "attributes", "experience", "game_mode", "flight_status", "persistent_data",
-    ]
-    .iter()
-    .map(|k| {
+    ] {
         let on = cfg.synchronization.features.enabled(&format!("husksync:{k}"));
-        format!("husksync:{k} {}", if on { '✔' } else { '❌' })
-    })
-    .collect::<Vec<_>>()
-    .join(", ");
-    let rows: Vec<(&str, String)> = vec![
-        ("Plugin Version", format!("v{}", env!("CARGO_PKG_VERSION"))),
-        ("Server Version", "Horizon".into()),
-        ("Language", cfg.language.clone()),
-        ("Minecraft Version", engine.platform.minecraft_version.clone()),
-        ("Java Version", "N/A (native server)".into()),
-        ("Java Vendor", "N/A (native server)".into()),
-        ("Server Name", engine.platform.server_name.clone()),
-        ("Cluster Id", if cfg.cluster_id.is_empty() { "None".into() } else { cfg.cluster_id.clone() }),
-        ("Sync Mode", mode),
-        ("Delay Latency", format!("{}ms", cfg.synchronization.network_latency_milliseconds)),
-        ("Database Type", kind),
-        ("Is Database Local", local(&cfg.database.host).into()),
-        ("Redis Version", engine.redis.version()),
-        ("Using Redis Sentinel", "No".into()),
-        ("Redis Database", cfg.redis.database.to_string()),
-        ("Using Redis User", yes(!cfg.redis.user.is_empty()).into()),
-        ("Using Redis Password", yes(!cfg.redis.password.is_empty()).into()),
-        ("Redis Using Ssl", yes(cfg.redis.use_ssl).into()),
-        ("Redis Latency", ms(engine.redis.ping())),
-        ("Is Redis Local", local(&cfg.redis.host).into()),
-        ("Locked User Handler", "HorizonEventListener".into()),
+        if !types.is_empty() {
+            types.push((", ".into(), None));
+        }
+        types.push((format!("husksync:{k} {}", if on { '✔' } else { '❌' }), Some(if on { GREEN } else { RED })));
+    }
+    let rows: Vec<(&str, Vec<(String, Option<&str>)>)> = vec![
+        ("Plugin Version", plain(format!("v{}", env!("CARGO_PKG_VERSION")))),
+        ("Server Version", plain("Horizon".into())),
+        ("Language", plain(cfg.language.clone())),
+        ("Minecraft Version", plain(engine.platform.minecraft_version.clone())),
+        ("Java Version", plain("N/A (native server)".into())),
+        ("Java Vendor", plain("N/A (native server)".into())),
+        ("Server Name", plain(engine.platform.server_name.clone())),
+        ("Cluster Id", plain(if cfg.cluster_id.is_empty() { "None".into() } else { cfg.cluster_id.clone() })),
+        ("Sync Mode", plain(mode)),
+        ("Delay Latency", plain(format!("{}ms", cfg.synchronization.network_latency_milliseconds))),
+        ("Database Type", plain(kind)),
+        ("Is Database Local", local(&cfg.database.host)),
+        ("Redis Version", plain(engine.redis.version())),
+        ("Using Redis Sentinel", yes(false)),
+        ("Redis Database", plain(cfg.redis.database.to_string())),
+        ("Using Redis User", yes(!cfg.redis.user.is_empty())),
+        ("Using Redis Password", yes(!cfg.redis.password.is_empty())),
+        ("Redis Using Ssl", yes(cfg.redis.use_ssl)),
+        ("Redis Latency", plain(ms(engine.redis.ping()))),
+        ("Is Redis Local", local(&cfg.redis.host)),
+        ("Locked User Handler", plain("HorizonEventListener".into())),
         ("Data Types", types),
     ];
-    rows.into_iter().map(|(k, v)| format!("• {k}: {v}")).collect()
+    rows.into_iter()
+        .map(|(name, value)| {
+            let mut parts = vec![
+                ("• ".to_owned(), part("• ", None, false, false, None, None)),
+                (name.to_owned(), part(name, Some("#848484"), false, false, None, None)),
+                (":".to_owned(), part(":", None, false, false, None, None)),
+                (" ".to_owned(), part(" ", Some("white"), false, false, None, None)),
+            ];
+            for (text, color) in value {
+                parts.push((text.clone(), part(&text, color, false, false, None, None)));
+            }
+            line_of(parts)
+        })
+        .collect()
 }
 
-/// `/horizonsync reload`: read the config file again. As in HuskSync, connections and the like keep
+/// `/husksync reload`: read the config file again. As in HuskSync, connections and the like keep
 /// their start-up values until a restart.
 fn reload(engine: &Engine) -> Result<(), String> {
     // `engine.dir` is `<server>/config/horizonsync`: the server folder is two levels up.
@@ -312,8 +450,9 @@ fn find_user(engine: &Engine, name: &str) -> Option<(u128, String)> {
     engine.db.user_by_name(name).ok().flatten()
 }
 
+/// `error_invalid_syntax`: the usage is a click-to-suggest.
 fn usage(engine: &Engine, to: Option<u128>, usage: &str) {
-    engine.tell(to, format!("Error: Incorrect syntax. Usage: {usage}"));
+    engine.say(to, "error_invalid_syntax", &[usage]);
 }
 
 /// A version argument that is present but not a UUID: the lookup fails, it does not fall back to the latest snapshot.
@@ -326,30 +465,23 @@ fn time_medium(ts: &str) -> String {
     util::parse_timestamp(ts).map(|t| t.format("%-d %b %Y, %H:%M").to_string()).unwrap_or_else(|| ts.to_owned())
 }
 
-/// `SaveCause.getLocale`: the `save_cause_*` text of en-gb.yml, the display name for other causes.
-fn cause_text(cause: &str) -> String {
-    match cause.to_lowercase().as_str() {
-        "disconnect" => "disconnect".into(),
-        "world_save" => "world save".into(),
-        "death" => "death".into(),
-        "server_shutdown" => "server shutdown".into(),
-        "save_command" => "save command".into(),
-        "dump_command" => "dump command".into(),
-        "inventory_command" => "inventory command".into(),
-        "enderchest_command" => "enderchest command".into(),
-        "backup_restore" => "backup restore".into(),
-        "api" => "API".into(),
-        "mpdb_migration" => "MPDB migration".into(),
-        "legacy_migration" => "legacy migration".into(),
-        "converted_from_v2" => "converted from v2".into(),
-        _ => cause_display(cause),
+/// `DateTimeFormatter.ofLocalizedDateTime(LONG, MEDIUM)` in the en-GB locale: `8 November 2026 at 05:20:33`.
+fn time_long(ts: &str) -> String {
+    util::parse_timestamp(ts).map(|t| t.format("%-d %B %Y at %H:%M:%S").to_string()).unwrap_or_else(|| ts.to_owned())
+}
+
+/// `SaveCause.getLocale`: the `save_cause_*` text of the locale file, the display name for other causes.
+fn cause_text(messages: &Messages, cause: &str) -> String {
+    match messages.raw(&format!("save_cause_{}", cause.to_lowercase()), &[]) {
+        Some(text) => text,
+        None => cause_display(cause),
     }
 }
 
-/// `error_invalid_data`: the details are a hover in HuskSync, so they go to the log here.
+/// `error_invalid_data`: the details are a hover.
 fn invalid_data(engine: &Engine, to: Option<u128>, reason: &str) {
     log::warn!("horizonsync: invalid snapshot: {reason}");
-    engine.tell(to, "Error: Failed to unpack user data as the snapshot is invalid or corrupt. (Details…)");
+    engine.say(to, "error_invalid_data", &[reason]);
 }
 
 fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
@@ -364,7 +496,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
         return;
     };
     let Some((player, name)) = find_user(engine, name) else {
-        engine.tell(to, "Error: Could not find a player by that name.");
+        engine.say(to, "error_invalid_player", &[]);
         return;
     };
     let version = args.get(2).and_then(|v| util::parse_uuid(v));
@@ -374,10 +506,11 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
         }
         version
     };
+    let player_id = util::uuid_string(player);
     match sub.as_str() {
         "view" => {
             if not_a_version(args.get(2)) {
-                return engine.tell(to, "Error: Could not find any user data for that version UUID.");
+                return engine.say(to, "error_invalid_version_uuid", &[]);
             }
             let stored = match version {
                 Some(v) => engine.db.snapshot(player, v),
@@ -385,11 +518,11 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             };
             match stored {
                 Ok(Some(s)) => match crate::horizonsync_core::db::usable(s.snapshot, &engine.platform) {
-                    Ok(s) => overview(engine, to, &s, &name, player),
+                    Ok(s) => overview(engine, sender, &s, &name, player),
                     Err(e) => invalid_data(engine, to, &e),
                 },
-                Ok(None) if version.is_some() => engine.tell(to, "Error: Could not find any user data for that version UUID."),
-                Ok(None) => engine.tell(to, "Error: Could not find any user data to display."),
+                Ok(None) if version.is_some() => engine.say(to, "error_invalid_version_uuid", &[]),
+                Ok(None) => engine.say(to, "error_no_data_to_display", &[]),
                 Err(e) => engine.tell(to, format!("Error: {e}")),
             }
         }
@@ -402,15 +535,17 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             match engine.db.delete_snapshot(player, v) {
                 Ok(true) => {
                     engine.redis.clear_user_data(player);
-                    engine.tell(to, format!("❌ Successfully deleted user data snapshot {} for {name}.", &util::uuid_string(v)[..8]));
+                    let version_id = util::uuid_string(v);
+                    let short = version_id.split('-').next().unwrap_or("").to_owned();
+                    engine.say(to, "data_deleted", &[&short, &version_id, &name, &player_id]);
                 }
-                Ok(false) => engine.tell(to, "Error: Could not find any user data for that version UUID."),
+                Ok(false) => engine.say(to, "error_invalid_version_uuid", &[]),
                 Err(e) => engine.tell(to, format!("Error: {e}")),
             }
         }
         "save" => {
             if engine.online_name(player).is_none() {
-                engine.tell(to, "Error: Could not find a player by that name.");
+                engine.say(to, "error_invalid_player", &[]);
                 return;
             }
             engine.save_command(player, &name, to);
@@ -419,7 +554,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             let Some(v) = need_version("restore") else { return };
             let stored = match engine.db.snapshot(player, v) {
                 Ok(Some(s)) => s,
-                Ok(None) => return engine.tell(to, "Error: Could not find any user data for that version UUID."),
+                Ok(None) => return engine.say(to, "error_invalid_version_uuid", &[]),
                 Err(e) => return engine.tell(to, format!("Error: {e}")),
             };
             let mut s = match crate::horizonsync_core::db::usable(stored.snapshot, &engine.platform) {
@@ -431,7 +566,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             s.save_cause = "BACKUP_RESTORE".into();
             s.pinned = engine.cfg().synchronization.auto_pin("BACKUP_RESTORE");
             engine.save_and_update(player, &s);
-            engine.tell(to, format!("⏪ Successfully restored {name}'s current user data from snapshot {}.", s.short_id()));
+            engine.say(to, "data_restored", &[&name, &player_id, s.short_id(), &s.id]);
         }
         "pin" => {
             let Some(v) = need_version("pin") else { return };
@@ -440,20 +575,17 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
                     Ok(s) => {
                         let pin = !s.pinned;
                         match engine.db.set_pinned(player, v, pin) {
-                            Ok(_) => engine.tell(
+                            Ok(_) => engine.say(
                                 to,
-                                format!(
-                                    "※ Successfully {} user data snapshot {} for {name}.",
-                                    if pin { "pinned" } else { "unpinned" },
-                                    s.short_id()
-                                ),
+                                if pin { "data_pinned" } else { "data_unpinned" },
+                                &[s.short_id(), &s.id, &name, &player_id],
                             ),
                             Err(e) => engine.tell(to, format!("Error: {e}")),
                         }
                     }
                     Err(e) => engine.tell(to, format!("Error: {e}")),
                 },
-                Ok(None) => engine.tell(to, "Error: Could not find any user data for that version UUID."),
+                Ok(None) => engine.say(to, "error_invalid_version_uuid", &[]),
                 Err(e) => engine.tell(to, format!("Error: {e}")),
             }
         }
@@ -471,11 +603,11 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             let s = match args.get(2) {
                 Some(_) => {
                     let Some(v) = version else {
-                        return engine.tell(to, "Error: Could not find any user data for that version UUID.");
+                        return engine.say(to, "error_invalid_version_uuid", &[]);
                     };
                     match engine.db.snapshot(player, v).ok().flatten().and_then(|s| s.snapshot.ok()) {
                         Some(s) => s,
-                        None => return engine.tell(to, "Error: Could not find any user data for that version UUID."),
+                        None => return engine.say(to, "error_invalid_version_uuid", &[]),
                     }
                 }
                 None => {
@@ -484,7 +616,7 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
                         .or_else(|| engine.db.latest_snapshot(player).ok().flatten().and_then(|s| s.snapshot.ok()));
                     match found {
                         Some(s) => s,
-                        None => return engine.tell(to, "Error: Could not find any user data to display."),
+                        None => return engine.say(to, "error_no_data_to_display", &[]),
                     }
                 }
             };
@@ -493,8 +625,11 @@ fn userdata(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             }
             match dump_to_file(engine, &s, &name) {
                 Ok(path) => {
-                    engine.tell(to, format!("☂ Successfully dumped user data snapshot {} for {name}. Click to view:", s.short_id()));
-                    engine.tell(to, path);
+                    engine.say(to, "data_dumped", &[s.short_id(), &name]);
+                    // The file name, underlined, copied on a click (`ClickEvent.copyToClipboard`).
+                    let mut line = part(&path, Some("gray"), false, true, None, None);
+                    line["click_event"] = json!({ "action": "copy_to_clipboard", "value": path });
+                    engine.tell_component(to, path.clone(), line);
                 }
                 Err(e) => log::error!("horizonsync: failed to dump user data: {e}"),
             }
@@ -515,103 +650,93 @@ fn dump_to_file(engine: &Engine, s: &Packed, name: &str) -> Result<String, Strin
     Ok(file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
-fn overview(engine: &Engine, to: Option<u128>, s: &Packed, name: &str, _player: u128) {
-    let id = &s.id;
-    let mut lines = vec![
-        format!("Viewing user data snapshot {} for {name}:", s.short_id()),
-        format!("⌚ {}", time_medium(&s.timestamp)),
-    ];
-    if s.pinned {
-        lines.push("※ Snapshot pinned".into());
+/// The keys of the advancements a snapshot has completed, recipes left out
+/// (`Advancements.getCompletedExcludingRecipes`).
+fn completed_advancements(adv: &Value) -> Vec<String> {
+    // HuskSync stores the list itself; an older build of this port wrote it under `completed`.
+    adv.get("completed")
+        .unwrap_or(adv)
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("key").and_then(|k| k.as_str()))
+                .filter(|k| !k.starts_with("minecraft:recipe"))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `DataSnapshotOverview.generateAdvancementPreview`: up to nine keys, then "and n more…".
+fn advancement_preview(messages: &Messages, completed: &[String]) -> String {
+    const PREVIEW_SIZE: usize = 8;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, key) in completed.iter().enumerate() {
+        lines.push(key.clone());
+        if i >= PREVIEW_SIZE {
+            break;
+        }
     }
-    lines.push(format!("⚑ {}", cause_text(&s.save_cause)));
-    lines.push(format!("☁ {}", s.server_name.as_deref().unwrap_or("N/A")));
-    // HuskSync's en-gb.yml misspells the status line's key (`data_manger_status`), so the line
-    // (health, hunger, level, game mode) is never shown by the stock locale; neither is it here.
-    lines.push(format!("⏏ {:.2}KiB", s.file_size(engine.platform.compress) as f64 / 1024.0));
+    if completed.len() > PREVIEW_SIZE {
+        let remaining = (completed.len() - PREVIEW_SIZE).to_string();
+        lines.push(
+            messages
+                .raw("data_manager_advancements_preview_remaining", &[&remaining])
+                .unwrap_or_else(|| format!("+{remaining}…")),
+        );
+    }
+    lines.join("\n")
+}
+
+fn overview(engine: &Engine, sender: &Sender, s: &Packed, name: &str, player: u128) {
+    let to = sender.uuid;
+    let id = &s.id;
+    let player_id = util::uuid_string(player);
+    engine.say(to, "data_manager_title", &[s.short_id(), id, name, &player_id]);
+    engine.say(to, "data_manager_timestamp", &[&time_medium(&s.timestamp), &s.timestamp]);
+    if s.pinned {
+        engine.say(to, "data_manager_pinned", &[]);
+    }
+    let cause = cause_text(&engine.cfg().messages, &s.save_cause);
+    engine.say(to, "data_manager_cause", &[&cause]);
+    engine.say(to, "data_manager_server", &[s.server_name.as_deref().unwrap_or("N/A")]);
+    // `data_manager_status` (health, hunger, level, game mode): HuskSync's en-gb.yml misspells its key
+    // (`data_manger_status`), so the stock locale never shows the line; neither does this port.
+    engine.say(to, "data_manager_size", &[&format!("{:.2}KiB", s.file_size(engine.platform.compress) as f64 / 1024.0)]);
     // Advancements and statistics, when the snapshot has both.
-    let get = |k: &str| s.data.get(k).and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok());
+    let get = |k: &str| s.data.get(k).and_then(|v| serde_json::from_str::<Value>(v).ok());
     if let (Some(adv), Some(stats)) = (get(keys::ADVANCEMENTS), get(keys::STATISTICS)) {
-        // HuskSync stores the list itself; an older build of this port wrote it under `completed`.
-        let done = adv
-            .get("completed")
-            .unwrap_or(&adv)
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|x| !x.get("key").and_then(|k| k.as_str()).unwrap_or("").starts_with("minecraft:recipe"))
-                    .count()
-            })
-            .unwrap_or(0);
+        let completed = completed_advancements(&adv);
         let generic = stats.get("generic");
         let ticks = ["play_time", "minecraft:play_time"]
             .iter()
             .find_map(|k| generic.and_then(|g| g.get(*k)).and_then(|v| v.as_i64()))
             .unwrap_or(0);
-        lines.push(format!("⭐ Advancements: {done}   ⌛ Play Time: {:.2}ʜʀs", ticks as f64 / 20.0 / 60.0 / 60.0));
-    }
-    // Lines of `[label](hover) -> command` buttons, as HuskSync's `data_manager_*_buttons`.
-    let rows: [(&str, Vec<(&str, &str, String)>); 3] = [
-        (
-            "View:",
-            vec![
-                ("[🪣 Inventory…]", "Click to view the inventory in this snapshot", format!("/inventory {name} {id}")),
-                ("[⌀ Ender Chest…]", "Click to view the Ender Chest in this snapshot", format!("/enderchest {name} {id}")),
-            ],
-        ),
-        (
-            "Manage:",
-            vec![
-                ("[❌ Delete…]", "Click to delete this snapshot", format!("/userdata delete {name} {id}")),
-                ("[⏪ Restore…]", "Click to restore the user to this snapshot", format!("/userdata restore {name} {id}")),
-                ("[※ Pin/Unpin…]", "Click to pin or unpin this snapshot", format!("/userdata pin {name} {id}")),
-            ],
-        ),
-        (
-            "System:",
-            vec![
-                ("[⏷ File Dump…]", "Click to dump this snapshot to a file", format!("/userdata dump {name} {id} file")),
-                ("[☂ Web Dump…]", "Click to dump this snapshot to the web", format!("/userdata dump {name} {id} web")),
-            ],
-        ),
-    ];
-    for l in lines {
-        engine.tell(to, l);
-    }
-    for (head, buttons) in rows {
-        let plain = format!(
-            "{head} {}",
-            buttons.iter().map(|(l, _, cmd)| format!("{l} ({cmd})")).collect::<Vec<_>>().join("   ")
+        let preview = advancement_preview(&engine.cfg().messages, &completed);
+        engine.say(
+            to,
+            "data_manager_advancements_statistics",
+            &[&completed.len().to_string(), &preview, &format!("{:.2}", ticks as f64 / 20.0 / 60.0 / 60.0)],
         );
-        engine.tell_component(to, plain, button_line(head, &buttons));
+    }
+    if sender.edit_all {
+        engine.say(to, "data_manager_item_buttons", &[name, id]);
+    }
+    engine.say(to, "data_manager_management_buttons", &[name, id]);
+    if sender.dump {
+        engine.say(to, "data_manager_system_buttons", &[name, id]);
     }
 }
-
-/// A text component for a head word and buttons that run a command on click and show a hint on
-/// hover (1.21.5+ component fields).
-fn button_line(head: &str, buttons: &[(&str, &str, String)]) -> serde_json::Value {
-    let mut extra = Vec::new();
-    for (label, hover, command) in buttons {
-        extra.push(serde_json::json!({ "text": " " }));
-        extra.push(serde_json::json!({
-            "text": label,
-            "click_event": { "action": "run_command", "command": command },
-            "hover_event": { "action": "show_text", "value": hover },
-        }));
-    }
-    serde_json::json!({ "text": head, "extra": extra })
-}
-
 
 /// `DataSnapshotList` / `PaginatedList`: newest first, six to a page, circled numbers, a footer
-/// with previous/next arrows and page jumpers.
+/// with previous/next arrows and page jumpers, all from the locale file.
 fn list(engine: &Engine, to: Option<u128>, player: u128, name: &str, page: usize) {
     let all = match engine.db.all_snapshots(player) {
         Ok(v) => v,
         Err(e) => return engine.tell(to, format!("Error: {e}")),
     };
     if all.is_empty() {
-        return engine.tell(to, "Error: Could not find any user data to display.");
+        return engine.say(to, "error_no_data_to_display", &[]);
     }
     const PER_PAGE: usize = 6;
     const ICONS: &str = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳";
@@ -619,47 +744,81 @@ fn list(engine: &Engine, to: Option<u128>, player: u128, name: &str, page: usize
     let page = page.clamp(1, pages);
     let start = (page - 1) * PER_PAGE;
     let end = (start + PER_PAGE).min(all.len());
-    engine.tell(to, format!("{name}'s user data snapshots: ({}-{} of {})", start + 1, end, all.len()));
-    engine.tell(to, "");
     let compress = engine.platform.compress;
+    let command = format!("/userdata list {name}");
+    let m = engine.cfg().messages.clone();
+    let mut out: Vec<crate::horizonsync_core::messages::Line> = Vec::new();
+    // `data_list_title`: "%1%'s user data snapshots: (%2%-%3% of %4%)\n".
+    out.extend(m.lines("data_list_title", &[name, &(start + 1).to_string(), &end.to_string(), &all.len().to_string()]));
     for (i, stored) in all[start..end].iter().enumerate() {
         let n = start + i + 1;
         let icon = if n <= 20 { ICONS.chars().nth(n - 1).map(String::from).unwrap_or_default() } else { n.to_string() };
-        let line = match &stored.snapshot {
-            Ok(s) => format!(
-                "{icon} {} {}   ⚑ {}   ⏏ {:.2}KiB",
-                if s.pinned { "※" } else { "  " },
-                time_medium(&s.timestamp),
-                cause_text(&s.save_cause),
-                s.file_size(compress) as f64 / 1024.0
+        let version = util::uuid_string(util::parse_uuid(&stored.version_uuid).unwrap_or(0));
+        let raw = match &stored.snapshot {
+            Ok(s) => m.raw(
+                "data_list_item",
+                &[
+                    &icon,
+                    name,
+                    &s.id,
+                    s.short_id(),
+                    if s.pinned { "※" } else { "  " },
+                    &time_medium(&s.timestamp),
+                    &time_long(&s.timestamp),
+                    &cause_text(&m, &s.save_cause),
+                    &format!("{:.2}KiB", s.file_size(compress) as f64 / 1024.0),
+                    "",
+                ],
             ),
             Err(e) => {
                 log::warn!("horizonsync: unreadable snapshot {}: {e}", stored.version_uuid);
-                format!("{icon}    {}", stored.version_uuid)
+                let short = version.get(..8).unwrap_or(&version).to_owned();
+                m.raw(
+                    "data_list_item_invalid",
+                    &[&icon, name, &version, &short, "  ", "?", "?", "?", "?", e],
+                )
             }
         };
-        engine.tell(to, line);
+        match raw {
+            Some(raw) => out.extend(Messages::render(&raw)),
+            None => out.extend(Messages::render(&format!("• {version}"))),
+        }
     }
-    // `list_footer`: "\n%1%Page %2%/%3%%4%   %5%"
+    // `list_footer`: "\n%1%Page %2%/%3%%4%   %5%".
+    let previous = if page > 1 {
+        m.raw("list_previous_page_button", &[&(page - 1).to_string(), &format!("{command} {}", page - 1)]).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let next = if page < pages {
+        m.raw("list_next_page_button", &[&(page + 1).to_string(), &format!("{command} {}", page + 1)]).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let group = (page - 1) / 10;
     let first = group * 10 + 1;
     let last = (first + 9).min(pages);
-    let jumpers = (first..=last).map(|p| p.to_string()).collect::<Vec<_>>().join(" ");
-    engine.tell(to, "");
-    engine.tell(
-        to,
-        format!(
-            "{}Page {page}/{pages}{}   ({jumpers})",
-            if page > 1 { "◀ " } else { "" },
-            if page < pages { " ▶" } else { "" }
-        ),
-    );
+    let buttons: Vec<String> = (first..=last)
+        .map(|p| {
+            if p == page {
+                m.raw("list_page_jumper_current_page", &[&p.to_string()]).unwrap_or_default()
+            } else {
+                m.raw("list_page_jumper_button", &[&p.to_string(), &format!("{command} {p}")]).unwrap_or_default()
+            }
+        })
+        .collect();
+    let separator = m.raw("list_page_jumper_separator", &[]).unwrap_or_else(|| " ".into());
+    let jumpers = m.raw("list_page_jumpers", &[&buttons.join(&separator)]).unwrap_or_default();
+    if let Some(footer) = m.raw("list_footer", &[&previous, &page.to_string(), &pages.to_string(), &next, &jumpers]) {
+        out.extend(Messages::render(&footer));
+    }
+    engine.say_lines(to, out);
 }
 
 fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
     let to = sender.uuid;
     let Some(viewer) = sender.uuid else {
-        return engine.tell(None, "Error: That command can only be used in-game.");
+        return engine.say(None, "error_in_game_command_only", &[]);
     };
     let label = match kind {
         Kind::Inventory => "inventory",
@@ -669,19 +828,19 @@ fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
         return usage(engine, to, &format!("/{label} <username> [version_uuid]"));
     };
     let Some((player, name)) = find_user(engine, name) else {
-        return engine.tell(to, "Error: Could not find a player by that name.");
+        return engine.say(to, "error_invalid_player", &[]);
     };
     let cause = match kind {
         Kind::Inventory => "INVENTORY_COMMAND",
         Kind::EnderChest => "ENDERCHEST_COMMAND",
     };
     if not_a_version(args.get(1)) {
-        return engine.tell(to, "Error: Could not find any user data for that version UUID.");
+        return engine.say(to, "error_invalid_version_uuid", &[]);
     }
     let snapshot = match args.get(1).and_then(|v| util::parse_uuid(v)) {
         Some(v) => match engine.db.snapshot(player, v) {
             Ok(Some(s)) => s.snapshot,
-            _ => return engine.tell(to, "Error: Could not find any user data for that version UUID."),
+            _ => return engine.say(to, "error_invalid_version_uuid", &[]),
         },
         None => match engine
             .online_user_data(player, cause)
@@ -689,7 +848,7 @@ fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
             .or_else(|| engine.db.latest_snapshot(player).ok().flatten().map(|s| s.snapshot))
         {
             Some(s) => s,
-            None => return engine.tell(to, "Error: Could not find any user data to display."),
+            None => return engine.say(to, "error_no_data_to_display", &[]),
         },
     };
     let s = match crate::horizonsync_core::db::usable(snapshot, &engine.platform) {
@@ -697,25 +856,22 @@ fn items(engine: &Arc<Engine>, sender: &Sender, args: &[String], kind: Kind) {
         Err(e) => return invalid_data(engine, to, &e),
     };
     let fallback = util::data_version_of(&s.minecraft_version);
-    let (title, rows, items) = match kind {
+    let (title_key, opened_key, rows, items) = match kind {
         Kind::Inventory => {
             let Some(inv) = s.data.get(keys::INVENTORY).and_then(|v| Inventory::deserialize(v, fallback).ok()) else {
-                return engine.tell(to, "Error: Could not find any user data to display.");
+                return engine.say(to, "error_no_data_to_display", &[]);
             };
-            (format!("{name}'s Inventory"), 5, inv.slots)
+            ("inventory_viewer_menu_title", "inventory_viewer_opened", 5, inv.slots)
         }
         Kind::EnderChest => {
             let Some(e) = s.data.get(keys::ENDER_CHEST).and_then(|v| EnderChest::deserialize(v, fallback).ok()) else {
-                return engine.tell(to, "Error: Could not find any user data to display.");
+                return engine.say(to, "error_no_data_to_display", &[]);
             };
-            (format!("{name}'s Ender Chest"), 3, e.slots)
+            ("ender_chest_viewer_menu_title", "ender_chest_viewer_opened", 3, e.slots)
         }
     };
-    let what = match kind {
-        Kind::Inventory => "inventory",
-        Kind::EnderChest => "Ender Chest",
-    };
-    engine.tell(to, format!("Viewing snapshot of {name}'s {what} as of ⌚ {}", time_medium(&s.timestamp)));
+    let title = word(engine, title_key, &[&name]);
+    engine.say(to, opened_key, &[&name, &time_medium(&s.timestamp)]);
     // Only the player's latest data is editable, and only with the `.edit` permission.
     let edit = (sender.edit && args.get(1).is_none()).then(|| crate::horizonsync_core::engine::MenuEdit {
         viewer,
@@ -732,39 +888,64 @@ mod tests {
 
     #[test]
     fn permission_nodes_per_sub_command() {
-        assert_eq!(permission_for("/userdata save Bob"), Some(("horizonsync.command.userdata.save".into(), OP)));
-        assert_eq!(permission_for("openinv Bob"), Some(("horizonsync.command.inventory".into(), OP)));
-        assert_eq!(permission_for("horizonsync about"), Some(("horizonsync.command.horizonsync.about".into(), 0)));
-        assert_eq!(permission_for("horizonsync"), Some(("horizonsync.command.horizonsync".into(), 0)));
-        assert_eq!(command_node("playerdata").as_deref(), Some("horizonsync.command.userdata"));
-        assert_eq!(command_node("echest"), Some("horizonsync.command.enderchest".into()));
+        assert_eq!(permission_for("/userdata save Bob"), Some(("husksync.command.userdata.save".into(), OP)));
+        assert_eq!(permission_for("openinv Bob"), Some(("husksync.command.inventory".into(), OP)));
+        // `about` and the bare command use the command's own node, which is for everyone.
+        assert_eq!(permission_for("husksync about"), Some(("husksync.command.husksync".into(), 0)));
+        assert_eq!(permission_for("husksync"), Some(("husksync.command.husksync".into(), 0)));
+        assert_eq!(command_node("playerdata").as_deref(), Some("husksync.command.userdata"));
+        assert_eq!(command_node("echest"), Some("husksync.command.enderchest".into()));
         assert_eq!(permission_for("lp info"), None);
-        assert_eq!(permission_for("horizonsync dump confirm"), Some(("horizonsync.command.horizonsync.dump".into(), OP)));
+        assert_eq!(permission_for("horizonsync status"), None);
+        assert_eq!(permission_for("hsync status"), None);
+        assert_eq!(permission_for("husksync dump confirm"), Some(("husksync.command.husksync.dump".into(), OP)));
+        assert_eq!(permission_for("husksync status"), Some(("husksync.command.husksync.status".into(), OP)));
     }
 
     #[test]
-    fn edit_nodes_and_buttons() {
-        assert_eq!(edit_permission_for("/openinv Bob").as_deref(), Some("horizonsync.command.inventory.edit"));
-        assert_eq!(edit_permission_for("echest Bob").as_deref(), Some("horizonsync.command.enderchest.edit"));
+    fn edit_nodes_and_about_menu() {
+        assert_eq!(edit_permission_for("/openinv Bob").as_deref(), Some("husksync.command.inventory.edit"));
+        assert_eq!(edit_permission_for("echest Bob").as_deref(), Some("husksync.command.enderchest.edit"));
         assert_eq!(edit_permission_for("userdata save Bob"), None);
-        let line = button_line("View:", &[("[a]", "hint", "/inventory Bob 1".into())]);
-        assert_eq!(line["extra"][1]["click_event"]["action"], "run_command");
-        assert_eq!(line["extra"][1]["click_event"]["command"], "/inventory Bob 1");
+        let about = about_lines();
+        assert_eq!(about[0].0, format!("HuskSync v{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(about[3].0, "Author: William278");
+        assert_eq!(about[3].1["extra"][1]["click_event"]["action"], "open_url");
+        assert_eq!(about[3].1["extra"][1]["click_event"]["url"], "https://william278.net");
     }
 
     #[test]
     fn times_and_causes_read_like_husksync() {
         assert_eq!(time_medium("2026-11-08T05:20:33.123+13:00"), "8 Nov 2026, 05:20");
-        assert_eq!(cause_text("SAVE_COMMAND"), "save command");
-        assert_eq!(cause_text("API"), "API");
-        assert_eq!(cause_text("SOME_PLUGIN"), "Some Plugin");
+        assert_eq!(time_long("2026-11-08T05:20:33.123+13:00"), "8 November 2026 at 05:20:33");
+        let m = Messages::default();
+        assert_eq!(cause_text(&m, "SAVE_COMMAND"), "save command");
+        assert_eq!(cause_text(&m, "API"), "API");
+        assert_eq!(cause_text(&m, "DEATH"), "death");
+        assert_eq!(cause_text(&m, "SOME_PLUGIN"), "Some Plugin");
+    }
+
+    #[test]
+    fn advancement_preview_lists_nine_keys_and_the_rest() {
+        let m = Messages::default();
+        let done: Vec<String> = (1..=12).map(|i| format!("minecraft:adv{i}")).collect();
+        let preview = advancement_preview(&m, &done);
+        let lines: Vec<&str> = preview.split('\n').collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "minecraft:adv1");
+        assert_eq!(lines[8], "minecraft:adv9");
+        assert_eq!(lines[9], "and 4 more…");
+        assert_eq!(advancement_preview(&m, &done[..2]), "minecraft:adv1\nminecraft:adv2");
+        let adv = serde_json::json!([{"key": "minecraft:recipes/a"}, {"key": "minecraft:story/root"}]);
+        assert_eq!(completed_advancements(&adv), vec!["minecraft:story/root".to_owned()]);
     }
 
     #[test]
     fn dump_and_console_only_usages() {
         let all = usages(&[]);
-        assert!(all.iter().any(|(u, l)| u == "horizonsync dump confirm" && *l == OP));
-        assert!(all.iter().any(|(u, l)| u == "horizonsync migrate" && *l == 4));
+        assert!(all.iter().any(|(u, l)| u == "husksync dump confirm" && *l == OP));
+        assert!(all.iter().any(|(u, l)| u == "husksync migrate" && *l == 4));
+        assert!(all.iter().any(|(u, l)| u == "husksync migrate start <migrator:word>" && *l == 4));
         assert!(all.iter().any(|(u, _)| u == "userdata dump <username:player_name> <version:word> file"));
         assert!(!all.iter().any(|(u, _)| u.contains("[type:word]")));
     }
@@ -772,7 +953,8 @@ mod tests {
     #[test]
     fn usages_cover_husksync_commands_and_respect_disabled() {
         let all = usages(&[]);
-        assert!(all.iter().any(|(u, l)| u == "horizonsync" && *l == 0));
+        assert!(all.iter().any(|(u, l)| u == "husksync" && *l == 0));
+        assert!(!all.iter().any(|(u, _)| u.starts_with("horizonsync") || u.starts_with("hsync")));
         assert!(all.iter().any(|(u, l)| u.starts_with("userdata restore") && *l == OP));
         assert!(all.iter().any(|(u, _)| u.starts_with("openechest")));
         let some = usages(&["inventory".into()]);

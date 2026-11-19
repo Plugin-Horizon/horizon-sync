@@ -198,8 +198,12 @@ pub struct Engine {
 /// Who runs a command.
 #[derive(Clone, Debug)]
 pub struct Sender {
-    /// May edit the items in `/inventory` and `/enderchest` (`horizonsync.command.*.edit`).
+    /// May edit the items in `/inventory` and `/enderchest` (`husksync.command.*.edit`).
     pub edit: bool,
+    /// Holds both edit nodes: `/userdata view` then shows the inventory and Ender Chest buttons.
+    pub edit_all: bool,
+    /// Holds `husksync.command.userdata.dump`: `/userdata view` then shows the system buttons.
+    pub dump: bool,
     /// None: the console.
     pub uuid: Option<u128>,
     pub name: String,
@@ -279,6 +283,20 @@ impl Engine {
         let lines = self.cfg().messages.lines(key, &[]);
         for line in lines {
             self.push(Action::Component { player: Some(player), text: line.plain, json: line.component, overlay });
+        }
+    }
+
+    /// A message of the locale file (`key`) with `args`, to a player (one chat line per line, with its
+    /// colours, hovers and clicks) or to the console (plain words, in the log).
+    pub(crate) fn say(&self, player: Option<u128>, key: &str, args: &[&str]) {
+        let lines = self.cfg().messages.lines(key, args);
+        self.say_lines(player, lines);
+    }
+
+    /// Chat lines already rendered from a template (`Messages::render`).
+    pub(crate) fn say_lines(&self, player: Option<u128>, lines: Vec<crate::horizonsync_core::messages::Line>) {
+        for line in lines {
+            self.push(Action::Component { player, text: line.plain, json: line.component, overlay: false });
         }
     }
 
@@ -633,15 +651,20 @@ impl Engine {
     }
 
     /// `DataSyncer.saveCurrentUserData`'s save part, for a snapshot already taken.
-    fn save_current(self: &Arc<Self>, player: u128, snapshot: Packed, reply: Option<(Option<u128>, String)>) {
+    fn save_current(
+        self: &Arc<Self>,
+        player: u128,
+        snapshot: Packed,
+        reply: Option<(Option<u128>, Vec<crate::horizonsync_core::messages::Line>)>,
+    ) {
         self.spawn(true, move |me| {
             me.persist(player, &snapshot);
             let critical = SHUTDOWN_CRITICAL_CAUSES.contains(&snapshot.save_cause.as_str());
             if !me.redis.set_user_data(player, &snapshot) && critical {
                 me.redis.clear_user_data(player);
             }
-            if let Some((to, text)) = reply {
-                me.tell(to, text);
+            if let Some((to, lines)) = reply {
+                me.say_lines(to, lines);
             }
         });
     }
@@ -808,7 +831,7 @@ impl Engine {
             let to = Some(edit.viewer);
             let latest = match me.db.latest_snapshot(edit.target) {
                 Ok(Some(s)) => s.snapshot,
-                _ => return me.tell(to, "Error: Could not find any user data to display."),
+                _ => return me.say(to, "error_no_data_to_display", &[]),
             };
             let mut s = match crate::horizonsync_core::db::usable(latest, &me.platform) {
                 Ok(s) => s.copy(),
@@ -844,12 +867,11 @@ impl Engine {
     /// `/userdata save`: a SAVE_COMMAND snapshot of a player on this server.
     pub(crate) fn save_command(self: &Arc<Self>, player: u128, name: &str, reply_to: Option<u128>) {
         match self.capture_blocking(player, "SAVE_COMMAND") {
-            Some(s) => self.save_current(
-                player,
-                s,
-                Some((reply_to, format!("Successfully saved a snapshot of {name}'s current user data."))),
-            ),
-            None => self.tell(reply_to, "Error: Could not find a player by that name."),
+            Some(s) => {
+                let lines = self.cfg().messages.lines("data_saved", &[name]);
+                self.save_current(player, s, Some((reply_to, lines)))
+            }
+            None => self.say(reply_to, "error_invalid_player", &[]),
         }
     }
 

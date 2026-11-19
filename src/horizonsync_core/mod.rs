@@ -157,7 +157,15 @@ pub fn is_running() -> bool {
     engine().is_some()
 }
 
-/// The permission node a command's registration names (`horizonsync.command.<command>`).
+/// The lines of a locale text (`error_no_permission`...): the running engine's file, else the built-in English.
+pub fn locale_lines(key: &str, args: &[&str]) -> Vec<messages::Line> {
+    match engine() {
+        Some(e) => e.cfg().messages.lines(key, args),
+        None => messages::Messages::default().lines(key, args),
+    }
+}
+
+/// The permission node a command's registration names (`husksync.command.<command>`).
 /// The node for editing the items of `/inventory` / `/enderchest`, if the line is one of those.
 pub fn edit_permission_for(line: &str) -> Option<String> {
     commands::edit_permission_for(line)

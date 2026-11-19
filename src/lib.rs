@@ -54,7 +54,7 @@ fn disabled_core_config() -> &'static str {
     Box::leak(core::DEFAULT_CONFIG.replace("host = \"localhost\"", "host = \"disabled.invalid\"").into_boxed_str())
 }
 
-/// The command labels this mod registers (`horizonsync`, `hsync`, `userdata`, ...).
+/// The command labels this mod registers (`husksync`, `userdata`, ...).
 fn labels() -> Vec<String> {
     let mut labels: Vec<String> = core::command_usages()
         .into_iter()
@@ -342,25 +342,23 @@ fn boolean_node(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
 }
 
-/// Every node `core::permission_for` can name, with its default operator level: the group nodes (the bare
-/// command, the inventory and ender chest views), the sub-command nodes and the edit nodes. `about` is for everyone.
+/// Every node `core::permission_for` can name, with its default operator level: the group nodes (the
+/// command, the inventory and ender chest views), the sub-command nodes and the edit nodes. The bare
+/// `/husksync` and `about` are for everyone (HuskSync's `Permission.Default.TRUE`).
 fn permission_nodes() -> Vec<(String, u8)> {
     let op = core::commands::OP;
-    let mut nodes: Vec<(String, u8)> = vec![
-        ("horizonsync.command.horizonsync".into(), op),
-        ("horizonsync.command.horizonsync.about".into(), 0),
-    ];
+    let mut nodes: Vec<(String, u8)> = vec![("husksync.command.husksync".into(), 0)];
     for sub in ["status", "reload", "update", "dump"] {
-        nodes.push((format!("horizonsync.command.horizonsync.{sub}"), op));
+        nodes.push((format!("husksync.command.husksync.{sub}"), op));
     }
-    nodes.push(("horizonsync.command.userdata".into(), op));
+    nodes.push(("husksync.command.userdata".into(), op));
     for sub in ["view", "list", "delete", "save", "restore", "pin", "dump"] {
-        nodes.push((format!("horizonsync.command.userdata.{sub}"), op));
+        nodes.push((format!("husksync.command.userdata.{sub}"), op));
     }
     for group in ["inventory", "enderchest"] {
-        nodes.push((format!("horizonsync.command.{group}"), op));
-        // The edit nodes default to operator level 2, as the legacy glue asked them.
-        nodes.push((format!("horizonsync.command.{group}.edit"), op));
+        nodes.push((format!("husksync.command.{group}"), op));
+        // HuskSync never declares the edit nodes: Bukkit's default for an unknown node is operators.
+        nodes.push((format!("husksync.command.{group}.edit"), op));
     }
     nodes
 }
@@ -753,32 +751,36 @@ impl Hooks for Mod {
             return Flow::Continue;
         };
         let edit_node = core::edit_permission_for(&line);
-        let (uuid, name, granted, edit) = match &event.source {
+        let (uuid, name, granted, edit, edit_all, dump) = match &event.source {
             CommandSource::Player { player, .. } => {
-                // The node's default (`permission_gather_nodes`) decides unless the handler answers; `about`
-                // defaults to everyone. Any error is a denial.
-                let granted = player.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false);
+                // The node's default (`permission_gather_nodes`) decides unless the handler answers; the
+                // bare command defaults to everyone. Any error is a denial.
+                let mut has = |n: &str| player.permission_bool(&mut *host, &boolean_node(n)).unwrap_or(false);
+                let granted = has(&node);
                 let edit = match &edit_node {
-                    Some(n) => player.permission_bool(&mut *host, &boolean_node(n)).unwrap_or(false),
+                    Some(n) => has(n),
                     None => false,
                 };
-                (Some(player.uuid()), player.name(&*host).unwrap_or_default(), granted, edit)
+                // `/userdata view` shows the item buttons to who may edit both, the dump buttons to who may dump.
+                let edit_all = has("husksync.command.inventory.edit") && has("husksync.command.enderchest.edit");
+                let dump = has("husksync.command.userdata.dump");
+                (Some(player.uuid()), player.name(&*host).unwrap_or_default(), granted, edit, edit_all, dump)
             }
-            CommandSource::Console { .. } => (None, "CONSOLE".to_string(), true, edit_node.is_some()),
-            // Command blocks and functions are not HorizonSync's senders.
+            CommandSource::Console { .. } => (None, "CONSOLE".to_string(), true, edit_node.is_some(), true, true),
+            // Command blocks and functions are not HuskSync's senders.
             _ => return Flow::Cancel,
         };
         // The core refuses a player below its operator level (2): 4 when the node is granted, 0 when
         // not, so the core answers the denial itself.
         let level = if granted { 4 } else { 0 };
-        let sender = core::Sender { uuid, name, level, edit };
+        let sender = core::Sender { uuid, name, level, edit, edit_all, dump };
         if core::perform_command(sender, &line) {
             return Flow::Cancel;
         }
         // Off (`enabled` not `true`): answer instead of "unknown command".
         if !core::is_running() {
             let _ = host.commands().feedback(Text::literal(
-                "HorizonSync is switched off on this server (enabled = false). Nothing was run.",
+                "HuskSync is switched off on this server (enabled = false). Nothing was run.",
             ));
             return Flow::Cancel;
         }
@@ -813,7 +815,13 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         event.cancelled = true;
-        event.replies.push(Text::literal("Error: You do not have permission to execute this command"));
+        for line in core::locale_lines("error_no_permission", &[]) {
+            let text = match host.text_from_json(&line.component.to_string()) {
+                Ok(Some(text)) => text,
+                _ => Text::literal(line.plain),
+            };
+            event.replies.push(text);
+        }
         Flow::Cancel
     }
 
