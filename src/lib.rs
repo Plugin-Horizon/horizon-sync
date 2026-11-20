@@ -23,7 +23,7 @@ use mod_api::{TriState,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
-    RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
+    RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
     StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
 };
@@ -524,11 +524,11 @@ fn carried_click(mode: i32, button: i32) -> bool {
 
 /// What a left (`true`) or right drag leaves in each of its `slots` from a cursor of `carried`: the cursor's
 /// stack shared out evenly, or one each. Zero when there is nothing to share.
-fn drag_share(carried: i32, slots: usize, left: bool) -> i32 {
+fn drag_share(carried: u32, slots: usize, left: bool) -> u32 {
     if slots == 0 {
         return 0;
     }
-    if left { carried / i32::try_from(slots).unwrap_or(i32::MAX) } else { 1 }
+    if left { carried / u32::try_from(slots).unwrap_or(u32::MAX) } else { 1 }
 }
 
 /// Swaps two places' stacks, each as far as the other takes it. Both are taken out before either is put
@@ -1155,9 +1155,8 @@ impl Hooks for Mod {
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // The public usages (`horizonsync`, `horizonsync about`) and the console-only ones (level 4) are open.
-        // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): the engine
-        // leaves it out of the tab list of a player without the node (as Bukkit hides a command whose node the
-        // sender lacks), and `player_command` answers the typed line with HuskSync's own denial.
+        // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): see
+        // register_node_commands. `player_command` answers the typed line with HuskSync's own denial.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
             let usage = usage.replace(":player_name>", ":word>");
@@ -1166,9 +1165,21 @@ impl Hooks for Mod {
                 continue;
             }
             let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
-            match core::permission_for(&literals.join(" ")) {
-                Some((node, _)) => event.commands.push(Command::op(&usage, level).with_node(&boolean_node(&node))),
-                None => event.commands.push(Command::new(&usage)),
+            if core::permission_for(&literals.join(" ")).is_none() {
+                event.commands.push(Command::new(&usage));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
+        for (usage, level) in core::command_usages() {
+            let usage = usage.replace(":player_name>", ":word>");
+            if level == 0 || level >= 4 {
+                continue;
+            }
+            let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
+            if let Some((node, _)) = core::permission_for(&literals.join(" ")) {
+                event.commands.push(Command::op(&usage, level).with_node(&boolean_node(&node)));
             }
         }
     }
