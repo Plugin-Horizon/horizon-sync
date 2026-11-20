@@ -227,12 +227,27 @@ fn husksync(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             None => engine.say(to, "system_dump_confirm", &[]),
             Some("confirm") => {
                 engine.say(to, "system_dump_started", &[]);
-                // The dump service (mc-logs) upload is not ported; nothing leaves the server.
-                say_mini(
-                    engine,
-                    to,
-                    "<color:#ff3300>Error:</color> <color:#ff7e5e>System status dumps are not available on Horizon.</color>",
-                );
+                // The mc-logs upload is not ported: the status lines go to a local file in `dumps/`, nothing leaves the server.
+                let engine2 = engine.clone();
+                engine.run_job(move |_| {
+                    let text: String = status_lines(&engine2).into_iter().map(|(plain, _)| plain + "\n").collect();
+                    match write_system_dump(&engine2, &text) {
+                        Ok(name) => {
+                            engine2.say(to, "system_dump_ready", &[]);
+                            let mut line = part(&name, Some("gray"), false, true, None, None);
+                            line["click_event"] = json!({ "action": "copy_to_clipboard", "value": name });
+                            engine2.tell_component(to, name.clone(), line);
+                        }
+                        Err(e) => {
+                            log::error!("horizonsync: failed to write the system dump: {e}");
+                            say_mini(
+                                &engine2,
+                                to,
+                                "<color:#ff3300>Error:</color> <color:#ff7e5e>Failed to write the system dump. Check console for errors.</color>",
+                            );
+                        }
+                    }
+                });
             }
             Some(_) => usage(engine, to, "/husksync dump [confirm]"),
         },
@@ -647,6 +662,17 @@ fn dump_to_file(engine: &Engine, s: &Packed, name: &str) -> Result<String, Strin
     let pretty = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
     std::fs::write(&file, pretty).map_err(|e| e.to_string())?;
     // Like HuskSync (`file.getName()`), show only the file name, never the server path.
+    Ok(file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+/// `/husksync dump confirm`: the status lines as a text file in `dumps/` (HuskSync uploads them to mc-logs).
+/// The status lines carry no secrets (passwords and users only as Yes/No).
+fn write_system_dump(engine: &Engine, text: &str) -> Result<String, String> {
+    let dir = engine.dir.join("dumps");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = util::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let file = dir.join(format!("system_{stamp}.txt"));
+    std::fs::write(&file, text).map_err(|e| e.to_string())?;
     Ok(file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
