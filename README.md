@@ -39,11 +39,13 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `server_switch` key and the network latency wait), with HuskSync's Redis polling (Fibonacci tick
   back-off, database fallback after 100 ticks) and its staleness rule (a Redis snapshot older than
   five seconds loses to a newer `DISCONNECT`/`SERVER_SHUTDOWN` database snapshot).
+- **Redis**: plain, or TLS with `redis.credentials.use_ssl` (`rediss://`, the system's certificates); with `redis.sentinel.master` the primary is found through the sentinels (`redis.sentinel.nodes`, `password`).
 - **Saves**: `DISCONNECT` on leave, `WORLD_SAVE` on every world save, `SERVER_SHUTDOWN` on stop (with
   the bounded wait and the verified retry of disconnect writes), `SAVE_COMMAND`, `BACKUP_RESTORE`,
   rotation (`max_user_data_snapshots`), `snapshot_backup_frequency`, auto-pinned causes, and `DEATH`
-  (`save_on_death`: the drops, or with `ITEMS_TO_KEEP` the inventory when `keep_inventory` is on; a dead
-  player's inventory is left empty when `sync_dead_players_changing_server` is off).
+  (`save_on_death`: the drops, or with `ITEMS_TO_KEEP` the inventory when `keep_inventory` is on; the drops past the
+  41 inventory slots are removed from the drops, as HuskSync does; a dead player's inventory is left empty when
+  `sync_dead_players_changing_server` is off).
 - **Cross-server messages**: `update_user_data`, `request_user_data`/`return_user_data` (an operator on
   another server views a player who is here), `check_in_petition`.
 - **The lock** while a player's data loads: commands (`blacklisted_commands_while_locked`), breaking,
@@ -87,7 +89,7 @@ from; keep `bukkit` to share with Paper), `database.timestamp_zone` (the zone of
 column, `local` as a Paper JVM on the same machine) and `[worlds]` (the Bukkit world name and UUID per
 dimension, for `location`).
 
-Not supported: `database.type` `POSTGRES`/`MONGO`, Redis Sentinel, Redis over TLS, map syncing.
+Not supported: `database.type` `POSTGRES`/`MONGO` (no driver in the build), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
 
 ## Build
 
@@ -104,13 +106,12 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
 - Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
-- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled.
+- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled. The advancement announcement of a locked player is still shown, and a quitting player's item on the cursor is not dropped (no hook cancels the announcement, and there is no item drop API).
 - Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
 - Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
 - `/husksync update` (no update checker, so no version answer), the mc-logs upload: `dump confirm` writes the status lines to `dumps/system_<time>.txt` instead, and `/userdata dump ... web` writes a file too. The `data_manager_status` line (the stock locale
-  misspells its key), POSTGRES/MONGO, Sentinel, TLS and map syncing are not implemented.
-- The editable menus use their own click handling (the game's chest menu moves nothing for a mod menu), so
-  drags, number keys, throws and double clicks do nothing, and a hover text line break is kept only in hovers.
+  misspells its key), POSTGRES/MONGO and map syncing (`persist_locked_maps`) are not implemented.
+- The editable menus carry out their clicks themselves (the game's chest menu moves nothing for a mod menu): pick up, put down, swap, shift-click, number keys, the off hand (F), double clicks and drags. Throws (Q, or a click outside the window) do nothing, as there is no item drop API. A hover text line break is kept only in hovers.
 - The DISCONNECT snapshot depends on hook order and is not fully verified.
 - Snapshot compatibility with the Java HuskSync plugin has to be checked on your data before you trust it: keep backups.
 
