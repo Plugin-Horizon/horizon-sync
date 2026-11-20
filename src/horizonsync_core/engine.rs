@@ -102,7 +102,8 @@ const SHUTDOWN_CRITICAL_DB_ATTEMPTS: u32 = 3;
 const SHUTDOWN_CRITICAL_DB_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const TICK: Duration = Duration::from_millis(50);
 /// `BukkitData.Items.Inventory.INVENTORY_SLOT_COUNT`: a death snapshot keeps at most this many stacks.
-const DEATH_INVENTORY_SLOTS: usize = 41;
+/// The inventory's slots with the armour and off hand (`Data.Items.Inventory.INVENTORY_SLOT_COUNT`).
+pub const DEATH_INVENTORY_SLOTS: usize = 41;
 
 /// `DataSnapshot.UpdateCause`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

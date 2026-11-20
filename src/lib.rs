@@ -86,6 +86,15 @@ struct EditMenu {
     items: Vec<Option<core::StoredItem>>,
     /// Whether a click changed anything: a menu only looked at saves nothing.
     changed: bool,
+    /// A drag in progress (its start came, its end not yet).
+    drag: Option<Drag>,
+}
+
+/// A drag in an editable menu: the button it started with and the menu slots it has crossed so far.
+#[derive(Clone, Debug, PartialEq)]
+struct Drag {
+    left: bool,
+    slots: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -102,6 +111,34 @@ struct Mod {
 
 /// The game's compound tag as the core's NBT type. Same tags, same values; floats and doubles come
 /// from their bit patterns. An end tag (only an empty list's element) becomes an empty list.
+impl Mod {
+    /// One click of a drag (mode 5, `ClickType::QUICK_CRAFT`): the start (button 0 left, 4 right), each added
+    /// slot (1 / 5) and the end (2 / 6). Returns the drag when its end comes and it has crossed slots.
+    fn drag_step(&self, viewer: u128, window: i32, button: i32, slot: Option<usize>) -> Option<Drag> {
+        let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+        let menu = menus.iter_mut().find(|m| m.viewer == viewer && m.window == window)?;
+        match button {
+            0 | 4 => {
+                menu.drag = Some(Drag { left: button == 0, slots: Vec::new() });
+                None
+            }
+            1 | 5 => {
+                if let (Some(drag), Some(slot)) = (menu.drag.as_mut(), slot) {
+                    if drag.left == (button == 1) && !drag.slots.contains(&slot) {
+                        drag.slots.push(slot);
+                    }
+                }
+                None
+            }
+            2 | 6 => {
+                let drag = menu.drag.take()?;
+                (drag.left == (button == 2) && !drag.slots.is_empty()).then_some(drag)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn to_core(tag: &Tag) -> core::Nbt {
     match tag {
         Tag::End => core::Nbt::List(Vec::new()),
@@ -472,16 +509,100 @@ fn menu_items(host: &mut dyn ServerHost, menu: MenuRef, rows: u8) -> Vec<Option<
     out
 }
 
-/// A click in an editable menu, as vanilla's `doClick` does it for the two kinds that move items: a left or
-/// right click that picks a stack up, puts the cursor's down or swaps them (a right click takes half or
-/// puts one), and a shift-click that sends a stack from the menu's own slots (the first `own`) to the
-/// viewer's inventory part and the other way. Everything in one transaction, so a click that cannot be
-/// carried out whole changes nothing. Drags, number keys, throws and double clicks do nothing. True when
-/// something moved.
-fn edit_click(host: &mut dyn ServerHost, menu: MenuRef, own: usize, slot: usize, button: i32, mode: i32) -> bool {
+/// The clicks this mod carries out in an editable menu (`ClickType` ids 0, 1, 2 and 6 with their buttons):
+/// a left or right pick up / put down / swap, a shift-click, a number key or off hand swap (button 40), and
+/// a double click. Drags (5) are carried out from their end; throws (4), the middle button (3) and the
+/// clicks outside the window (slot -999) are not.
+fn carried_click(mode: i32, button: i32) -> bool {
+    match mode {
+        0 | 1 => matches!(button, 0 | 1),
+        2 => matches!(button, 0..=8 | 40),
+        6 => button == 0,
+        _ => false,
+    }
+}
+
+/// What a left (`true`) or right drag leaves in each of its `slots` from a cursor of `carried`: the cursor's
+/// stack shared out evenly, or one each. Zero when there is nothing to share.
+fn drag_share(carried: i32, slots: usize, left: bool) -> i32 {
+    if slots == 0 {
+        return 0;
+    }
+    if left { carried / i32::try_from(slots).unwrap_or(i32::MAX) } else { 1 }
+}
+
+/// Swaps two places' stacks, each as far as the other takes it. Both are taken out before either is put
+/// back, so a swap that cannot be carried out whole changes nothing.
+fn swap_places(host: &mut dyn ServerHost, tx: &mod_api::Transaction, a: &ItemPlace, b: &ItemPlace) -> Result<(), ()> {
+    let stack_a = a.stack(host).map(|s| (ItemResource::of(&s), s.count()));
+    let stack_b = b.stack(host).map(|s| (ItemResource::of(&s), s.count()));
+    if stack_a.is_none() && stack_b.is_none() {
+        return Err(());
+    }
+    let mut ok = true;
+    if let Some((resource, count)) = &stack_a {
+        ok &= a.extract(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_b {
+        ok &= b.extract(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_a {
+        ok &= b.insert(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_b {
+        ok &= a.insert(host, tx, resource, *count) == *count;
+    }
+    if ok { Ok(()) } else { Err(()) }
+}
+
+/// A click in an editable menu, as vanilla's `doClick` does it for the kinds that move items: a left or right
+/// click that picks a stack up, puts the cursor's down or swaps them (a right click takes half or puts one),
+/// a shift-click that sends a stack from the menu's own slots (the first `own`) to the viewer's inventory part
+/// and the other way, a number key (hotbar `button` 0..=8) or off hand (40) swap with the viewer's own
+/// inventory, and a double click that gathers the cursor's kind from every slot. Everything in one
+/// transaction, so a click that cannot be carried out whole changes nothing. True when something moved.
+fn edit_click(host: &mut dyn ServerHost, menu: MenuRef, viewer: u128, own: usize, slot: usize, button: i32, mode: i32) -> bool {
+    if !carried_click(mode, button) {
+        return false;
+    }
     let place = ItemPlace::MenuSlot { menu, slot };
     let cursor = menu.cursor();
     let moved: Result<(), ()> = host.transaction(|host, tx| {
+        if mode == 2 {
+            // The viewer's hotbar is the last nine of their inventory part (`own + 27..own + 36`), the off hand
+            // is the player's own slot -106.
+            let other = if button == 40 {
+                ItemPlace::PlayerSlot { player: viewer, slot: -106 }
+            } else {
+                let hotbar = own + 27 + usize::try_from(button).unwrap_or(0);
+                if hotbar == slot {
+                    return Err(());
+                }
+                ItemPlace::MenuSlot { menu, slot: hotbar }
+            };
+            return swap_places(host, tx, &place, &other);
+        }
+        if mode == 6 {
+            // Every slot of the menu gives its stacks of the cursor's kind until the cursor is as full as it takes.
+            let Some(carried) = cursor.stack(host) else { return Err(()) };
+            let resource = ItemResource::of(&carried);
+            let mut gathered = 0;
+            for source in 0..own + 36 {
+                let from = ItemPlace::MenuSlot { menu, slot: source };
+                let Some(stack) = from.stack(host) else { continue };
+                if !(stack.same_item(&carried) && stack.same_components(&carried)) {
+                    continue;
+                }
+                let placed = cursor.insert(host, tx, &resource, stack.count());
+                if placed > 0 {
+                    if from.extract(host, tx, &resource, placed) != placed {
+                        return Err(());
+                    }
+                    gathered += placed;
+                }
+            }
+            return if gathered > 0 { Ok(()) } else { Err(()) };
+        }
         let here = place.stack(host);
         if mode == 1 {
             let Some(stack) = here else { return Err(()) };
@@ -540,6 +661,32 @@ fn put_down(
     let put = if button == 1 { 1 } else { carried.count() };
     let placed = place.insert(host, tx, &resource, put);
     if placed > 0 && cursor.extract(host, tx, &resource, placed) == placed { Ok(()) } else { Err(()) }
+}
+
+/// The end of a drag: the cursor's stack is shared out over the dragged slots (`drag_share`), each slot taking
+/// what it accepts (empty or the cursor's kind), and the rest stays on the cursor. True when something moved.
+fn drag_carry(host: &mut dyn ServerHost, menu: MenuRef, drag: &Drag) -> bool {
+    let cursor = menu.cursor();
+    let moved: Result<(), ()> = host.transaction(|host, tx| {
+        let Some(carried) = cursor.stack(host) else { return Err(()) };
+        let resource = ItemResource::of(&carried);
+        let share = drag_share(carried.count(), drag.slots.len(), drag.left);
+        if share == 0 {
+            return Err(());
+        }
+        let mut shared = 0;
+        for &slot in &drag.slots {
+            let placed = ItemPlace::MenuSlot { menu, slot }.insert(host, tx, &resource, share);
+            if placed > 0 {
+                if cursor.extract(host, tx, &resource, placed) != placed {
+                    return Err(());
+                }
+                shared += placed;
+            }
+        }
+        if shared > 0 { Ok(()) } else { Err(()) }
+    });
+    moved.is_ok()
 }
 
 /// Item stacks as the core stores them: the vanilla item compound at the server's data version. A stack
@@ -939,6 +1086,7 @@ impl Hooks for Mod {
                                     rows,
                                     items,
                                     changed: false,
+                                    drag: None,
                                 });
                             }
                         }
@@ -952,9 +1100,6 @@ impl Hooks for Mod {
     // The clicks of an editable `/inventory` or `/enderchest` menu (`InventoryCommand` lets its viewer
     // take and put items); the menu moves nothing itself, so they are carried out here.
     fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
-        if !matches!(event.mode, 0 | 1) || !matches!(event.button, 0 | 1) || event.slot < 0 {
-            return;
-        }
         let rows = {
             let menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
             match menus.iter().find(|m| m.viewer == event.uuid && m.window == event.window) {
@@ -963,14 +1108,19 @@ impl Hooks for Mod {
             }
         };
         let own = usize::from(rows) * 9;
-        let slot = event.slot as usize;
-        if slot >= own + 36 {
-            return;
-        }
+        let slot = usize::try_from(event.slot).ok().filter(|s| *s < own + 36);
+        // A drag is collected over its start, its added slots and its end (mode 5); the end carries it out.
+        let drag = if event.mode == 5 { self.drag_step(event.uuid, event.window, event.button, slot) } else { None };
         let Some(menu) = host.menu(event.uuid, event.window) else {
             return;
         };
-        if !edit_click(host, menu, own, slot, event.button, event.mode) {
+        let moved = match (event.mode, drag, slot) {
+            (5, Some(drag), _) => drag_carry(host, menu, &drag),
+            (5, None, _) => false,
+            (_, _, Some(slot)) => edit_click(host, menu, event.uuid, own, slot, event.button, event.mode),
+            _ => false,
+        };
+        if !moved {
             return;
         }
         let items = menu_items(host, menu, rows);
@@ -1122,6 +1272,11 @@ impl Hooks for Mod {
             event.drops.clear();
             return Flow::Continue;
         }
+        // `BukkitEventListener.handlePlayerDeath`: with save_on_death on, the drops past the inventory's slots are
+        // removed from the event before the snapshot is taken, so they are not dropped in the world either.
+        if let Some(limit) = core::death_drop_limit() {
+            event.drops.truncate(limit);
+        }
         if core::death_saves_kept_items() {
             return Flow::Continue;
         }
@@ -1265,5 +1420,26 @@ mod tests {
         }, "DataVersion": 5023 });
         assert_eq!(statistic_updates(&plan), vec![(StatType::Used, "minecraft:bread".to_owned(), 2)]);
         assert!(statistic_updates(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn menu_clicks_carried_out_are_the_vanilla_kinds_with_their_buttons() {
+        assert!(carried_click(0, 0) && carried_click(0, 1));
+        assert!(carried_click(1, 0) && carried_click(1, 1));
+        assert!(!carried_click(0, 2));
+        assert!(carried_click(2, 0) && carried_click(2, 8) && carried_click(2, 40));
+        assert!(!carried_click(2, 9) && !carried_click(2, 39));
+        assert!(carried_click(6, 0) && !carried_click(6, 1));
+        assert!(!carried_click(4, 0), "throws are not carried out");
+        assert!(!carried_click(3, 2), "the middle button is not carried out");
+    }
+
+    #[test]
+    fn drag_shares_the_cursor_evenly_on_a_left_drag_and_one_each_on_a_right_one() {
+        assert_eq!(drag_share(10, 3, true), 3);
+        assert_eq!(drag_share(10, 3, false), 1);
+        assert_eq!(drag_share(2, 3, true), 0);
+        assert_eq!(drag_share(5, 0, true), 0);
+        assert_eq!(drag_share(64, 4, true), 16);
     }
 }

@@ -92,6 +92,13 @@ pub fn on_death(player: u128, compound: &Nbt, items: Vec<StoredItem>) {
     }
 }
 
+/// With `save_on_death` on and `items_to_save: DROPS`: how many drops a death keeps (the inventory's slots).
+/// None otherwise, when the drops are left alone.
+pub fn death_drop_limit() -> Option<usize> {
+    let saves = engine().is_some_and(|e| e.cfg().synchronization.save_on_death.enabled);
+    (saves && !death_saves_kept_items()).then_some(engine::DEATH_INVENTORY_SLOTS)
+}
+
 /// What `save_on_death.items_to_save` says to save: true for `ITEMS_TO_KEEP`, false for `DROPS`.
 pub fn death_saves_kept_items() -> bool {
     engine().is_some_and(|e| e.cfg().synchronization.save_on_death.items_to_save.eq_ignore_ascii_case("ITEMS_TO_KEEP"))
