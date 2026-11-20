@@ -413,7 +413,7 @@ fn status_lines(engine: &Engine) -> Vec<(String, Value)> {
         ("Database Type", plain(kind)),
         ("Is Database Local", local(&cfg.database.host)),
         ("Redis Version", plain(engine.redis.version())),
-        ("Using Redis Sentinel", yes(false)),
+        ("Using Redis Sentinel", yes(!cfg.redis.sentinel.master.trim().is_empty())),
         ("Redis Database", plain(cfg.redis.database.to_string())),
         ("Using Redis User", yes(!cfg.redis.user.is_empty())),
         ("Using Redis Password", yes(!cfg.redis.password.is_empty())),

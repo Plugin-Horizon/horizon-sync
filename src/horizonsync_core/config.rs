@@ -174,7 +174,7 @@ pub struct Redis {
     pub test_while_idle: bool,
     pub min_evictable_idle_time_millis: u64,
     pub time_between_eviction_runs_millis: u64,
-    /// `redis.sentinel`: not supported (a non-empty `master` is logged at start).
+    /// `redis.sentinel`: with a `master`, the primary is found through these sentinels (`redis_mgr`).
     pub sentinel: Sentinel,
 }
 
@@ -440,9 +440,6 @@ impl Config {
         } else {
             Self::read(toml_dir)?
         };
-        if !c.redis.sentinel.master.is_empty() {
-            log::warn!("horizonsync: redis.sentinel is not supported; connecting to redis.host directly");
-        }
         Ok(c)
     }
 
