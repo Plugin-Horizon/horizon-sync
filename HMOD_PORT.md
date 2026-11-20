@@ -1,4 +1,11 @@
 # hmod port: husksync
+Parity: before ~65% -> after ~66% (191/290 items; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated; items blocked by engine API count as not done)
+Round 3 (blind, no compile)
+- Fixed: a locked player launches no projectile. `right_click_item` (cancel before `Item.use`) refuses the items that launch one (bow, crossbow, trident, snowball, egg, ender pearl, potions, experience bottle, wind charge, fishing rod, firework rocket) through `core::refuse_launch`, so `allow_pearl_spawning_while_locked` still lets pearls through. A projectile from a dispenser or a mob is not a player's and is not in the original's lock either.
+- Added: advancement sync behind the cargo feature `horizon_advancements` (off by default): `read_player` takes `player.advancements(host)` (vanilla's save JSON) into the snapshot, `apply` loads it with `player.set_advancements(host, json)`; the core's `records` already converts both ways. The two host calls (`player_advancements`, `player_set_advancements`) are in the open upstream pull request `gap-advancements`, not in the pinned SDK: the method names on `PlayerRef` are assumed from the other player calls.
+- Left open, no engine API: clicks in a locked player's own inventory screen (no cancelling hook; `container_opened` is refused); advancements without the feature; map sync.
+- Left open, out of scope here: update checker and web dump (network), POSTGRES and MONGO databases, Redis Sentinel and TLS (crates and a live test), the stock locale's misspelt `data_manager_status` line.
+- Unsure: `RightClickItemEvent` field `click.player` / `click.stack`; `ItemStack::item().id(host)` returning a string-like with `as_str`.
 Round 1
 - Fixed: src/lib.rs imports: added `InteractionResult, MenuReplace, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType`.
 - Fixed: src/lib.rs `read_player`: `player.advancements` / `player.statistics` reads removed (2 errors), replaced by a HMOD-GAP comment.

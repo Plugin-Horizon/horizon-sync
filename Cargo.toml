@@ -20,3 +20,8 @@ snap = "1"
 indexmap = { version = "2", features = ["serde"] }
 getrandom = "0.3"
 
+
+[features]
+# Per-player advancement sync through `player_advancements` / `player_set_advancements`, which an open upstream pull
+# request adds (gap-advancements); not in the pinned SDK yet, so off by default.
+horizon_advancements = []

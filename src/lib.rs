@@ -23,7 +23,7 @@ use mod_api::{TriState,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
-    RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
+    RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
     StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
 };
@@ -166,8 +166,17 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    // HMOD-GAP(player-advancements): Horizon main has no per-player advancement read (only `advancement(id)`
-    // lookups), so the advancements are not read here and not synced; a snapshot carries them over.
+    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`. That host call is in an open upstream
+    // pull request (gap-advancements), not in the pinned SDK, so it is behind the `horizon_advancements` cargo feature
+    // (off by default); without it a snapshot carries the advancements over unchanged.
+    #[cfg(feature = "horizon_advancements")]
+    {
+        if core::feature_enabled("husksync:advancements") {
+            if let Some(json) = player.advancements(&*host) {
+                nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
+            }
+        }
+    }
     if core::feature_enabled("husksync:statistics") {
         if let Some(json) = read_statistics(&*host, player) {
             nbt.put(core::records::RECORD_STATISTICS, core::Nbt::String(json));
@@ -589,8 +598,16 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
             return false;
         }
     }
-    // HMOD-GAP(player-advancements): Horizon main has no per-player advancement write. The plan's
-    // advancements are not applied; the mod loses that part of the sync.
+    // Advancements: `player_set_advancements` loads the saved progress as vanilla loads its file (nothing is awarded: no
+    // toast, chat line or reward). Behind the `horizon_advancements` feature, see `read_player`.
+    #[cfg(feature = "horizon_advancements")]
+    {
+        if let Some(advancements) = &plan.advancements {
+            if !player.set_advancements(host, &advancements.to_string()) {
+                log(&format!("advancements not applied for {uuid:032x}"));
+            }
+        }
+    }
     // Statistics: each saved count replaces the player's (`Player.resetStat`, then `awardStat`); a statistic the
     // snapshot does not list keeps its count, as Bukkit's `setStatistic` loop does.
     if let Some(stats) = &plan.statistics {
@@ -727,6 +744,23 @@ fn command_line(host: &dyn ServerHost, command: &CommandInvocation) -> String {
     }
     words.join(" ")
 }
+
+/// The items whose use launches a projectile: bow, crossbow, trident, the throwables, the potions and the bottle, the wind
+/// charge, the fishing rod's bobber and the firework rocket.
+const LAUNCHING_ITEMS: [&str; 12] = [
+    "minecraft:bow",
+    "minecraft:crossbow",
+    "minecraft:trident",
+    "minecraft:snowball",
+    "minecraft:egg",
+    "minecraft:ender_pearl",
+    "minecraft:splash_potion",
+    "minecraft:lingering_potion",
+    "minecraft:experience_bottle",
+    "minecraft:wind_charge",
+    "minecraft:fishing_rod",
+    "minecraft:firework_rocket",
+];
 
 /// Holds a command or action of a player whose data is still loading (BukkitLockedEventListener).
 fn acting_flow(host: &dyn ServerHost) -> Flow {
@@ -1183,9 +1217,20 @@ impl Hooks for Mod {
         if event.kind == "minecraft:player" && core::is_locked_entity(event.entity) { Flow::Cancel } else { Flow::Continue }
     }
 
-    // HMOD-GAP(locked-projectile-cancel): `player_launch_projectile` and `projectile_launch` only listen, after the
-    // projectile exists; removing it would also lose the thrown item, which HuskSync's cancel gives back. A locked
-    // player's ender pearl or arrow is not refused (`core::refuse_launch` is ready for a cancelling hook).
+    // A locked player launches no projectile (`onProjectileLaunch`). `player_launch_projectile` and `projectile_launch`
+    // only listen, after the projectile exists, so the use that would launch it is refused instead: `right_click_item`
+    // cancels before `Item.use` for the items that launch one (ender pearls stay allowed with
+    // `allow_pearl_spawning_while_locked`, `core::refuse_launch`). Projectiles from dispensers or a mob are no player's.
+    fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
+        let HostSide::Server(host) = host else { return Flow::Continue };
+        let item = event.click.stack.item().id(&*host);
+        if LAUNCHING_ITEMS.contains(&item.as_str()) && core::refuse_launch(event.click.player, item.as_str()) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
     // HMOD-GAP(locked-inventory-click): no hook answers a click in the player's own inventory screen, which
     // `BukkitLockedEventListener.onInventoryClick` cancels; only `container_opened` is refused.
 }

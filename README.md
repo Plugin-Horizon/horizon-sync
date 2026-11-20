@@ -104,9 +104,8 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
 - Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
-- Locked players can still launch projectiles and click in their own inventory while their data loads
-  (no hook cancels them; damage is cancelled).
-- Advancements are not read or written (no per-player advancement API): they are carried over.
+- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled.
+- Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
 - Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
 - `/husksync update` and `dump confirm`, web dumps, the `data_manager_status` line (the stock locale
   misspells its key), POSTGRES/MONGO, Sentinel, TLS and map syncing are not implemented.
