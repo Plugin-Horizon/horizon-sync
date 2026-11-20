@@ -107,7 +107,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled.
 - Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
 - Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
-- `/husksync update` and `dump confirm`, web dumps, the `data_manager_status` line (the stock locale
+- `/husksync update` (no update checker, so no version answer), the mc-logs upload: `dump confirm` writes the status lines to `dumps/system_<time>.txt` instead, and `/userdata dump ... web` writes a file too. The `data_manager_status` line (the stock locale
   misspells its key), POSTGRES/MONGO, Sentinel, TLS and map syncing are not implemented.
 - The editable menus use their own click handling (the game's chest menu moves nothing for a mod menu), so
   drags, number keys, throws and double clicks do nothing, and a hover text line break is kept only in hovers.
