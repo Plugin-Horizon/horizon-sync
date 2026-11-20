@@ -1,5 +1,9 @@
 # HorizonSync
 
+## Port status
+
+Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
+
 HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
 Rust server for Minecraft 26.3). Players keep their inventory, ender chest, health, hunger, experience,
 effects, game mode, attributes and (optionally) location when they move between servers that share
@@ -30,26 +34,35 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   and the other way round.
 - **Data types** (`synchronization.features`): `inventory`, `ender_chest`, `potion_effects`, `health`,
   `hunger`, `experience`, `game_mode`, `flight_status`, `attributes`, `persistent_data` and `location`
-  are captured from and applied to the player. `advancements`, `statistics` and other plugins' types
-  are carried over unchanged from the snapshot the player last received (Horizon does not read or
-  write them yet), so a Paper server still finds them.
+  are captured from and applied to the player. `statistics` too (every key of the block, item, entity
+  type and custom statistic registries is read with `player_stat`; applying resets each saved
+  statistic and awards its count). `advancements` and other plugins' types are carried over unchanged
+  from the snapshot the player last received (Horizon does not read or write them yet), so a Paper
+  server still finds them.
 - **Server switches.** `LOCKSTEP` (the `data_checkout` key, check-in petitions) and `DELAY` (the
   `server_switch` key and the network latency wait), with HuskSync's Redis polling (Fibonacci tick
   back-off, database fallback after 100 ticks) and its staleness rule (a Redis snapshot older than
   five seconds loses to a newer `DISCONNECT`/`SERVER_SHUTDOWN` database snapshot).
+- **Redis**: plain, or TLS with `redis.credentials.use_ssl` (`rediss://`, the system's certificates); with `redis.sentinel.master` the primary is found through the sentinels (`redis.sentinel.nodes`, `password`).
 - **Saves**: `DISCONNECT` on leave, `WORLD_SAVE` on every world save, `SERVER_SHUTDOWN` on stop (with
   the bounded wait and the verified retry of disconnect writes), `SAVE_COMMAND`, `BACKUP_RESTORE`,
-  rotation (`max_user_data_snapshots`), `snapshot_backup_frequency`, auto-pinned causes.
+  rotation (`max_user_data_snapshots`), `snapshot_backup_frequency`, auto-pinned causes, and `DEATH`
+  (`save_on_death`: the drops, or with `ITEMS_TO_KEEP` the inventory when `keep_inventory` is on; the drops past the
+  41 inventory slots are removed from the drops, as HuskSync does; a dead player's inventory is left empty when
+  `sync_dead_players_changing_server` is off).
 - **Cross-server messages**: `update_user_data`, `request_user_data`/`return_user_data` (an operator on
   another server views a player who is here), `check_in_petition`.
 - **The lock** while a player's data loads: commands (`blacklisted_commands_while_locked`), breaking,
   placing and using, attacking and interacting, picking up items, opening containers, armour stands,
   taking damage.
-- **Commands** (operator level 2 for everything but `/horizonsync about`; `/horizonsync` has the alias `/hsync`; `/userdata`, `/inventory` and `/enderchest` keep their generic names; permission nodes are `horizonsync.command.*`):
-  `/horizonsync [about|status|reload|update|dump [confirm]]` (`forceupgrade`/`migrate` are console-only stubs),
+- **Commands** (operator level 2 for everything but `/husksync` and `/husksync about`; permission nodes are `husksync.command.*`, as in HuskSync; every text comes from the locale file: the embedded `messages-en-gb.yml`, overridden key by key by `messages-<language>.yml`):
+  `/husksync [about|status|reload|update|dump [confirm]]` (`forceupgrade`/`migrate` are console-only stubs),
   `/userdata view|list|delete|save|restore|pin|dump` (alias `/playerdata`),
   `/inventory <player> [version]` (`/invsee`, `/openinv`) and `/enderchest <player> [version]`
-  (`/echest`, `/openechest`), the last two as a read-only chest menu.
+  (`/echest`, `/openechest`), the last two as a chest menu; with `husksync.command.inventory.edit` /
+  `husksync.command.enderchest.edit` the player's latest data can be edited (left and right click pick
+  up, put down and swap, shift-click moves between the menu and the viewer's inventory; drags, number
+  keys, throws and double clicks do nothing) and is saved as a new snapshot when the menu closes.
 
 ## Item compatibility
 
@@ -80,7 +93,7 @@ from; keep `bukkit` to share with Paper), `database.timestamp_zone` (the zone of
 column, `local` as a Paper JVM on the same machine) and `[worlds]` (the Bukkit world name and UUID per
 dimension, for `location`).
 
-Not supported: `database.type` `POSTGRES`/`MONGO`, Redis Sentinel, Redis over TLS, map syncing.
+Not supported: `database.type` `POSTGRES`/`MONGO` (no driver in the build), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
 
 ## Build
 
@@ -97,8 +110,12 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
 - Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
-- The editable `/inventory` and `/enderchest` menus open read-only (the menu-close event carries no slots).
-- Locked players can still take damage and launch projectiles while their data loads.
+- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled. The advancement announcement of a locked player is still shown, and a quitting player's item on the cursor is not dropped (no hook cancels the announcement, and there is no item drop API).
+- Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
+- Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
+- `/husksync update` (no update checker, so no version answer), the mc-logs upload: `dump confirm` writes the status lines to `dumps/system_<time>.txt` instead, and `/userdata dump ... web` writes a file too. The `data_manager_status` line (the stock locale
+  misspells its key), POSTGRES/MONGO and map syncing (`persist_locked_maps`) are not implemented.
+- The editable menus carry out their clicks themselves (the game's chest menu moves nothing for a mod menu): pick up, put down, swap, shift-click, number keys, the off hand (F), double clicks and drags. Throws (Q, or a click outside the window) do nothing, as there is no item drop API. A hover text line break is kept only in hovers.
 - The DISCONNECT snapshot depends on hook order and is not fully verified.
 - Snapshot compatibility with the Java HuskSync plugin has to be checked on your data before you trust it: keep backups.
 

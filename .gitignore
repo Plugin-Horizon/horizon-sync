@@ -3,3 +3,4 @@ core/Cargo.lock
 /target
 /core/target
 Cargo.lock
+.horizon/

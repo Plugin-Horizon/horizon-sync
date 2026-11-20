@@ -7,20 +7,25 @@
 //! `config/horizonsync/config.toml` the game writes points at `disabled.invalid` (no database, no
 //! Redis) until the operator sets the hosts. A plan with anything the engine cannot take (an item at
 //! another data version, an unreadable item or attribute) is refused whole, never applied in part.
+
+pub mod horizonsync_core;
 #[cfg(any())]
 mod legacy_glue;
 
 use horizonsync_core as core;
-use mod_api::{TriState, 
+use mod_api::{TriState,
     ArmorStandManipulateEvent, AttackEntityEvent, AttributeModifier, AttributeOperation, Identifier, ItemStack,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
     CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
-    EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, ItemPickedUpEvent, ItemTossEvent,
-    LeftClickBlockEvent, LivingRef, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
+    EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
+    GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LevelRandomHost,
+    LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
+    MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
+    PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     PlayerSaveToFileEvent,
-    RegisterCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent,
+    RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
+    StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
 };
 use std::sync::Mutex;
 
@@ -51,7 +56,7 @@ fn disabled_core_config() -> &'static str {
     Box::leak(core::DEFAULT_CONFIG.replace("host = \"localhost\"", "host = \"disabled.invalid\"").into_boxed_str())
 }
 
-/// The command labels this mod registers (`horizonsync`, `hsync`, `userdata`, ...).
+/// The command labels this mod registers (`husksync`, `userdata`, ...).
 fn labels() -> Vec<String> {
     let mut labels: Vec<String> = core::command_usages()
         .into_iter()
@@ -70,8 +75,31 @@ struct Deferred {
     waited: u32,
 }
 
+/// An open `/inventory` or `/enderchest` menu its viewer may edit: the clicks are carried out here (the
+/// menu itself moves nothing) and the contents are saved when it closes.
+struct EditMenu {
+    viewer: u128,
+    window: i32,
+    edit: core::MenuEdit,
+    rows: u8,
+    /// The menu's own slots as the core stores them, as of the last click that changed them.
+    items: Vec<Option<core::StoredItem>>,
+    /// Whether a click changed anything: a menu only looked at saves nothing.
+    changed: bool,
+    /// A drag in progress (its start came, its end not yet).
+    drag: Option<Drag>,
+}
+
+/// A drag in an editable menu: the button it started with and the menu slots it has crossed so far.
+#[derive(Clone, Debug, PartialEq)]
+struct Drag {
+    left: bool,
+    slots: Vec<usize>,
+}
+
 #[derive(Default)]
 struct Mod {
+    edit_menus: Mutex<Vec<EditMenu>>,
     deferred: Mutex<Vec<Deferred>>,
     /// Players read at `player_save_to_file` this tick, for the leave snapshot in `player_logged_out`
     /// (the leave's save comes first, with the player still readable). Emptied every tick start, so
@@ -83,6 +111,34 @@ struct Mod {
 
 /// The game's compound tag as the core's NBT type. Same tags, same values; floats and doubles come
 /// from their bit patterns. An end tag (only an empty list's element) becomes an empty list.
+impl Mod {
+    /// One click of a drag (mode 5, `ClickType::QUICK_CRAFT`): the start (button 0 left, 4 right), each added
+    /// slot (1 / 5) and the end (2 / 6). Returns the drag when its end comes and it has crossed slots.
+    fn drag_step(&self, viewer: u128, window: i32, button: i32, slot: Option<usize>) -> Option<Drag> {
+        let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+        let menu = menus.iter_mut().find(|m| m.viewer == viewer && m.window == window)?;
+        match button {
+            0 | 4 => {
+                menu.drag = Some(Drag { left: button == 0, slots: Vec::new() });
+                None
+            }
+            1 | 5 => {
+                if let (Some(drag), Some(slot)) = (menu.drag.as_mut(), slot) {
+                    if drag.left == (button == 1) && !drag.slots.contains(&slot) {
+                        drag.slots.push(slot);
+                    }
+                }
+                None
+            }
+            2 | 6 => {
+                let drag = menu.drag.take()?;
+                (drag.left == (button == 2) && !drag.slots.is_empty()).then_some(drag)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn to_core(tag: &Tag) -> core::Nbt {
     match tag {
         Tag::End => core::Nbt::List(Vec::new()),
@@ -147,17 +203,90 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    if let Some(json) = player.advancements(&*host) {
-        nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
+    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`. That host call is in an open upstream
+    // pull request (gap-advancements), not in the pinned SDK, so it is behind the `horizon_advancements` cargo feature
+    // (off by default); without it a snapshot carries the advancements over unchanged.
+    #[cfg(feature = "horizon_advancements")]
+    {
+        if core::feature_enabled("husksync:advancements") {
+            if let Some(json) = player.advancements(&*host) {
+                nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
+            }
+        }
     }
-    if let Some(json) = player.statistics(&*host) {
-        nbt.put(core::records::RECORD_STATISTICS, core::Nbt::String(json));
+    if core::feature_enabled("husksync:statistics") {
+        if let Some(json) = read_statistics(&*host, player) {
+            nbt.put(core::records::RECORD_STATISTICS, core::Nbt::String(json));
+        }
     }
     if let Some(data) = player.persistent_data(&*host) {
         nbt.put("NeoForgeData", to_core(&Tag::Compound(data)));
     }
     core::player::mod_data_as_bukkit_values(&mut nbt);
     Some(nbt)
+}
+
+/// The statistic types HuskSync syncs: vanilla's category name, the type and the registry that lists the keys.
+const STAT_CATEGORIES: [(&str, StatType, &str); 9] = [
+    ("minecraft:mined", StatType::Mined, "minecraft:block"),
+    ("minecraft:crafted", StatType::Crafted, "minecraft:item"),
+    ("minecraft:used", StatType::Used, "minecraft:item"),
+    ("minecraft:broken", StatType::Broken, "minecraft:item"),
+    ("minecraft:picked_up", StatType::PickedUp, "minecraft:item"),
+    ("minecraft:dropped", StatType::Dropped, "minecraft:item"),
+    ("minecraft:killed", StatType::Killed, "minecraft:entity_type"),
+    ("minecraft:killed_by", StatType::KilledBy, "minecraft:entity_type"),
+    ("minecraft:custom", StatType::Custom, "minecraft:custom_stat"),
+];
+
+/// The player's statistics as vanilla's `stats/<uuid>.json` says them (`{"stats":{"minecraft:mined":
+/// {"minecraft:stone":5}}}`, counts above zero only): every key of every registry is asked, as the game
+/// has no list of what a player has counted.
+fn read_statistics(host: &dyn ServerHost, player: PlayerRef) -> Option<String> {
+    let mut found: Vec<(&str, String, i32)> = Vec::new();
+    for (category, kind, registry) in STAT_CATEGORIES {
+        let Some(keys) = host.registry_entries(registry) else {
+            continue;
+        };
+        for key in keys {
+            let id = key.to_string();
+            let count = player.stat(&*host, kind, &id).unwrap_or(0);
+            if count > 0 {
+                found.push((category, id, count));
+            }
+        }
+    }
+    Some(statistics_document(&found))
+}
+
+/// The `stats/<uuid>.json` text of counted statistics (category, key, count).
+fn statistics_document(found: &[(&str, String, i32)]) -> String {
+    let mut stats = serde_json::Map::new();
+    for (category, key, count) in found {
+        let entry = stats.entry((*category).to_owned()).or_insert_with(|| serde_json::json!({}));
+        entry[key.as_str()] = serde_json::json!(count);
+    }
+    serde_json::json!({ "stats": stats }).to_string()
+}
+
+/// A plan's statistics (`{"stats":{category:{key:count}}}`) as (type, key, count) to set. A category the
+/// game does not have, a key that is not a name and a count that is negative or too big are left out.
+fn statistic_updates(plan: &serde_json::Value) -> Vec<(StatType, String, i32)> {
+    let mut out = Vec::new();
+    let Some(categories) = plan.get("stats").and_then(|s| s.as_object()) else {
+        return out;
+    };
+    for (category, counts) in categories {
+        let Some((_, kind, _)) = STAT_CATEGORIES.iter().find(|(name, _, _)| name == category) else {
+            continue;
+        };
+        for (key, count) in counts.as_object().into_iter().flatten() {
+            if let Some(count) = count.as_i64().and_then(|c| i32::try_from(c).ok()).filter(|c| *c >= 0) {
+                out.push((*kind, key.clone(), count));
+            }
+        }
+    }
+    out
 }
 
 /// Binary NBT (big-endian, Java's file form) as the core's NBT, one tag of type `id`.
@@ -322,11 +451,13 @@ fn finite_or(v: f32, or: f32) -> f32 {
     if v.is_finite() { v } else { or }
 }
 
-/// Whether the player is in the world but dead (`LivingEntity.isAlive` is false).
+/// Whether the player is in the world but dead (`LivingEntity.isAlive` is false) and the health data
+/// type is on: HuskSync only waits for the respawn then (`user.isDead() && Identifier.HEALTH.isEnabled()`).
 fn is_dead(host: &dyn ServerHost, uuid: u128) -> bool {
-    host
-        .player(uuid)
-        .is_some_and(|p| LivingRef::new(p.entity()).alive(host) == Some(false))
+    core::feature_enabled("husksync:health")
+        && host
+            .player(uuid)
+            .is_some_and(|p| LivingRef::new(p.entity()).alive(host) == Some(false))
 }
 
 /// Respawns a dead player as their own Respawn click would (`player_respawn`). False when the
@@ -335,7 +466,239 @@ fn respawn(host: &mut dyn ServerHost, uuid: u128) -> bool {
     let Some(player) = host.player(uuid) else {
         return false;
     };
-    player.respawn(host)
+    player.respawn(host).is_ok()
+}
+
+/// A typed Boolean permission node, as the game's handler answers it.
+fn boolean_node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// Every node `core::permission_for` can name, with its default operator level: the group nodes (the
+/// command, the inventory and ender chest views), the sub-command nodes and the edit nodes. The bare
+/// `/husksync` and `about` are for everyone (HuskSync's `Permission.Default.TRUE`).
+fn permission_nodes() -> Vec<(String, u8)> {
+    let op = core::commands::OP;
+    let mut nodes: Vec<(String, u8)> = vec![("husksync.command.husksync".into(), 0)];
+    for sub in ["status", "reload", "update", "dump"] {
+        nodes.push((format!("husksync.command.husksync.{sub}"), op));
+    }
+    nodes.push(("husksync.command.userdata".into(), op));
+    for sub in ["view", "list", "delete", "save", "restore", "pin", "dump"] {
+        nodes.push((format!("husksync.command.userdata.{sub}"), op));
+    }
+    for group in ["inventory", "enderchest"] {
+        nodes.push((format!("husksync.command.{group}"), op));
+        // HuskSync never declares the edit nodes: Bukkit's default for an unknown node is operators.
+        nodes.push((format!("husksync.command.{group}.edit"), op));
+    }
+    nodes
+}
+
+/// The menu's own slots (the first `rows * 9`) as the core stores them.
+fn menu_items(host: &mut dyn ServerHost, menu: MenuRef, rows: u8) -> Vec<Option<core::StoredItem>> {
+    let version = host.server_data_version();
+    let mut out = Vec::new();
+    for slot in 0..usize::from(rows) * 9 {
+        let stack = ItemPlace::MenuSlot { menu, slot }.stack(host);
+        out.push(stack.and_then(|stack| {
+            let compound = stack.to_nbt(&*host)?;
+            Some(core::StoredItem { item: to_core(&Tag::Compound(compound)), data_version: version })
+        }));
+    }
+    out
+}
+
+/// The clicks this mod carries out in an editable menu (`ClickType` ids 0, 1, 2 and 6 with their buttons):
+/// a left or right pick up / put down / swap, a shift-click, a number key or off hand swap (button 40), and
+/// a double click. Drags (5) are carried out from their end; throws (4), the middle button (3) and the
+/// clicks outside the window (slot -999) are not.
+fn carried_click(mode: i32, button: i32) -> bool {
+    match mode {
+        0 | 1 => matches!(button, 0 | 1),
+        2 => matches!(button, 0..=8 | 40),
+        6 => button == 0,
+        _ => false,
+    }
+}
+
+/// What a left (`true`) or right drag leaves in each of its `slots` from a cursor of `carried`: the cursor's
+/// stack shared out evenly, or one each. Zero when there is nothing to share.
+fn drag_share(carried: u32, slots: usize, left: bool) -> u32 {
+    if slots == 0 {
+        return 0;
+    }
+    if left { carried / u32::try_from(slots).unwrap_or(u32::MAX) } else { 1 }
+}
+
+/// Swaps two places' stacks, each as far as the other takes it. Both are taken out before either is put
+/// back, so a swap that cannot be carried out whole changes nothing.
+fn swap_places(host: &mut dyn ServerHost, tx: &mod_api::Transaction, a: &ItemPlace, b: &ItemPlace) -> Result<(), ()> {
+    let stack_a = a.stack(host).map(|s| (ItemResource::of(&s), s.count()));
+    let stack_b = b.stack(host).map(|s| (ItemResource::of(&s), s.count()));
+    if stack_a.is_none() && stack_b.is_none() {
+        return Err(());
+    }
+    let mut ok = true;
+    if let Some((resource, count)) = &stack_a {
+        ok &= a.extract(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_b {
+        ok &= b.extract(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_a {
+        ok &= b.insert(host, tx, resource, *count) == *count;
+    }
+    if let Some((resource, count)) = &stack_b {
+        ok &= a.insert(host, tx, resource, *count) == *count;
+    }
+    if ok { Ok(()) } else { Err(()) }
+}
+
+/// A click in an editable menu, as vanilla's `doClick` does it for the kinds that move items: a left or right
+/// click that picks a stack up, puts the cursor's down or swaps them (a right click takes half or puts one),
+/// a shift-click that sends a stack from the menu's own slots (the first `own`) to the viewer's inventory part
+/// and the other way, a number key (hotbar `button` 0..=8) or off hand (40) swap with the viewer's own
+/// inventory, and a double click that gathers the cursor's kind from every slot. Everything in one
+/// transaction, so a click that cannot be carried out whole changes nothing. True when something moved.
+fn edit_click(host: &mut dyn ServerHost, menu: MenuRef, viewer: u128, own: usize, slot: usize, button: i32, mode: i32) -> bool {
+    if !carried_click(mode, button) {
+        return false;
+    }
+    let place = ItemPlace::MenuSlot { menu, slot };
+    let cursor = menu.cursor();
+    let moved: Result<(), ()> = host.transaction(|host, tx| {
+        if mode == 2 {
+            // The viewer's hotbar is the last nine of their inventory part (`own + 27..own + 36`), the off hand
+            // is the player's own slot -106.
+            let other = if button == 40 {
+                ItemPlace::PlayerSlot { player: viewer, slot: -106 }
+            } else {
+                let hotbar = own + 27 + usize::try_from(button).unwrap_or(0);
+                if hotbar == slot {
+                    return Err(());
+                }
+                ItemPlace::MenuSlot { menu, slot: hotbar }
+            };
+            return swap_places(host, tx, &place, &other);
+        }
+        if mode == 6 {
+            // Every slot of the menu gives its stacks of the cursor's kind until the cursor is as full as it takes.
+            let Some(carried) = cursor.stack(host) else { return Err(()) };
+            let resource = ItemResource::of(&carried);
+            let mut gathered = 0;
+            for source in 0..own + 36 {
+                let from = ItemPlace::MenuSlot { menu, slot: source };
+                let Some(stack) = from.stack(host) else { continue };
+                if !(stack.same_item(&carried) && stack.same_components(&carried)) {
+                    continue;
+                }
+                let placed = cursor.insert(host, tx, &resource, stack.count());
+                if placed > 0 {
+                    if from.extract(host, tx, &resource, placed) != placed {
+                        return Err(());
+                    }
+                    gathered += placed;
+                }
+            }
+            return if gathered > 0 { Ok(()) } else { Err(()) };
+        }
+        let here = place.stack(host);
+        if mode == 1 {
+            let Some(stack) = here else { return Err(()) };
+            let resource = ItemResource::of(&stack);
+            let targets = if slot < own { own..own + 36 } else { 0..own };
+            let mut left = stack.count();
+            for target in targets {
+                if left == 0 {
+                    break;
+                }
+                left -= ItemPlace::MenuSlot { menu, slot: target }.insert(host, tx, &resource, left).min(left);
+            }
+            let sent = stack.count() - left;
+            return if sent > 0 && place.extract(host, tx, &resource, sent) == sent { Ok(()) } else { Err(()) };
+        }
+        let held = cursor.stack(host);
+        match (held, here) {
+            (None, None) => Err(()),
+            // Pick up: all of the slot's stack, or half of it (rounded up) on a right click.
+            (None, Some(stack)) => {
+                let take = if button == 1 { stack.count().div_ceil(2) } else { stack.count() };
+                let resource = ItemResource::of(&stack);
+                let ok = place.extract(host, tx, &resource, take) == take && cursor.insert(host, tx, &resource, take) == take;
+                if ok { Ok(()) } else { Err(()) }
+            }
+            // Put down onto an empty slot or the same stack: all of the cursor's, or one on a right click.
+            (Some(carried), None) => put_down(host, tx, &place, &cursor, &carried, button),
+            (Some(carried), Some(stack)) if carried.same_item(&stack) && carried.same_components(&stack) => {
+                put_down(host, tx, &place, &cursor, &carried, button)
+            }
+            // Another stack: swap.
+            (Some(carried), Some(stack)) => {
+                let (carried_resource, resource) = (ItemResource::of(&carried), ItemResource::of(&stack));
+                let (carried_count, count) = (carried.count(), stack.count());
+                let ok = place.extract(host, tx, &resource, count) == count
+                    && cursor.extract(host, tx, &carried_resource, carried_count) == carried_count
+                    && place.insert(host, tx, &carried_resource, carried_count) == carried_count
+                    && cursor.insert(host, tx, &resource, count) == count;
+                if ok { Ok(()) } else { Err(()) }
+            }
+        }
+    });
+    moved.is_ok()
+}
+
+/// Moves the cursor's stack (or one of it on a right click) into the slot as far as the slot takes it.
+fn put_down(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    place: &ItemPlace,
+    cursor: &ItemPlace,
+    carried: &ItemStack,
+    button: i32,
+) -> Result<(), ()> {
+    let resource = ItemResource::of(carried);
+    let put = if button == 1 { 1 } else { carried.count() };
+    let placed = place.insert(host, tx, &resource, put);
+    if placed > 0 && cursor.extract(host, tx, &resource, placed) == placed { Ok(()) } else { Err(()) }
+}
+
+/// The end of a drag: the cursor's stack is shared out over the dragged slots (`drag_share`), each slot taking
+/// what it accepts (empty or the cursor's kind), and the rest stays on the cursor. True when something moved.
+fn drag_carry(host: &mut dyn ServerHost, menu: MenuRef, drag: &Drag) -> bool {
+    let cursor = menu.cursor();
+    let moved: Result<(), ()> = host.transaction(|host, tx| {
+        let Some(carried) = cursor.stack(host) else { return Err(()) };
+        let resource = ItemResource::of(&carried);
+        let share = drag_share(carried.count(), drag.slots.len(), drag.left);
+        if share == 0 {
+            return Err(());
+        }
+        let mut shared = 0;
+        for &slot in &drag.slots {
+            let placed = ItemPlace::MenuSlot { menu, slot }.insert(host, tx, &resource, share);
+            if placed > 0 {
+                if cursor.extract(host, tx, &resource, placed) != placed {
+                    return Err(());
+                }
+                shared += placed;
+            }
+        }
+        if shared > 0 { Ok(()) } else { Err(()) }
+    });
+    moved.is_ok()
+}
+
+/// Item stacks as the core stores them: the vanilla item compound at the server's data version. A stack
+/// the game cannot write as a compound is left out.
+fn stored_items<'a>(host: &dyn ServerHost, stacks: impl Iterator<Item = &'a ItemStack>) -> Vec<core::StoredItem> {
+    let version = host.server_data_version();
+    stacks
+        .filter_map(|stack| {
+            let compound = stack.to_nbt(host)?;
+            Some(core::StoredItem { item: to_core(&Tag::Compound(compound)), data_version: version })
+        })
+        .collect()
 }
 
 /// Carries out an apply plan on a player who is on, in HuskSync's dependency order. False when the
@@ -377,27 +740,38 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
             log(&format!("persistent data not applied for {uuid:032x}: not a compound"));
             return false;
         };
-        if !player.set_persistent_data(host, compound) {
+        if player.set_persistent_data(host, compound).is_err() {
             log(&format!("persistent data not applied for {uuid:032x}: refused by the engine"));
             return false;
         }
     }
-    if let Some(advancements) = &plan.advancements {
-        if !player.set_advancements(host, &advancements.to_string()) {
-            log(&format!("advancements not applied for {uuid:032x}: refused by the engine"));
-            return false;
+    // Advancements: `player_set_advancements` loads the saved progress as vanilla loads its file (nothing is awarded: no
+    // toast, chat line or reward). Behind the `horizon_advancements` feature, see `read_player`.
+    #[cfg(feature = "horizon_advancements")]
+    {
+        if let Some(advancements) = &plan.advancements {
+            if !player.set_advancements(host, &advancements.to_string()) {
+                log(&format!("advancements not applied for {uuid:032x}"));
+            }
         }
     }
-    if let Some(statistics) = &plan.statistics {
-        if !player.set_statistics(host, &statistics.to_string()) {
-            log(&format!("statistics not applied for {uuid:032x}: refused by the engine"));
-            return false;
+    // Statistics: each saved count replaces the player's (`Player.resetStat`, then `awardStat`); a statistic the
+    // snapshot does not list keeps its count, as Bukkit's `setStatistic` loop does.
+    if let Some(stats) = &plan.statistics {
+        for (kind, key, count) in statistic_updates(stats) {
+            if !player.reset_stat(host, kind, &key) {
+                log(&format!("statistic {key} not written for {uuid:032x}"));
+                continue;
+            }
+            if count > 0 && !player.award_stat(host, kind, &key, count) {
+                log(&format!("statistic {key} not awarded for {uuid:032x}"));
+            }
         }
     }
     // Inventory (all 43 vanilla slots, empty ones cleared) and the held slot, then the ender chest.
     if let Some((stacks, held)) = inventory {
         for (slot, stack) in stacks.into_iter().enumerate() {
-            if !matches!(player.set_inventory_slot(host, slot as u32, stack), Ok(true)) {
+            if player.set_inventory_slot(host, slot as u32, stack).is_err() {
                 log(&format!("inventory slot {slot} not written for {uuid:032x}"));
             }
         }
@@ -405,7 +779,7 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
     }
     if let Some(stacks) = ender_chest {
         for (slot, stack) in stacks.into_iter().enumerate() {
-            if !matches!(player.set_ender_chest_slot(host, slot as u32, stack), Ok(true)) {
+            if player.set_ender_chest_slot(host, slot as u32, stack).is_err() {
                 log(&format!("ender chest slot {slot} not written for {uuid:032x}"));
             }
         }
@@ -517,6 +891,23 @@ fn command_line(host: &dyn ServerHost, command: &CommandInvocation) -> String {
     }
     words.join(" ")
 }
+
+/// The items whose use launches a projectile: bow, crossbow, trident, the throwables, the potions and the bottle, the wind
+/// charge, the fishing rod's bobber and the firework rocket.
+const LAUNCHING_ITEMS: [&str; 12] = [
+    "minecraft:bow",
+    "minecraft:crossbow",
+    "minecraft:trident",
+    "minecraft:snowball",
+    "minecraft:egg",
+    "minecraft:ender_pearl",
+    "minecraft:splash_potion",
+    "minecraft:lingering_potion",
+    "minecraft:experience_bottle",
+    "minecraft:wind_charge",
+    "minecraft:fishing_rod",
+    "minecraft:firework_rocket",
+];
 
 /// Holds a command or action of a player whose data is still loading (BukkitLockedEventListener).
 fn acting_flow(host: &dyn ServerHost) -> Flow {
@@ -677,29 +1068,95 @@ impl Hooks for Mod {
                     show(host, p, line, overlay);
                 }
                 core::Action::Component { player: None, text, .. } => log(&text),
-                // The /inventory and /enderchest views as a native chest menu (`item_from_snbt`). Native
-                // menus move nothing, so an editable one opens read-only: an edit cannot be taken back
-                // (TODO(arismoko-api: menu_input_closed), menu_closed carries no slots).
+                // The /inventory and /enderchest views as a native chest menu (`item_from_snbt`). A menu its viewer
+                // may edit is remembered: `menu_clicked` carries the clicks out, `menu_closed` saves the contents.
                 core::Action::OpenMenu { viewer, title, rows, items, edit } => {
+                    let rows = rows.clamp(1, 6);
                     let stacks: Vec<Option<ItemStack>> = items
                         .iter()
                         .map(|i| i.as_ref().and_then(|i| host.item_from_snbt(&i.item.to_snbt())))
                         .collect();
-                    if host.open_menu(viewer, rows.clamp(1, 6), Text::literal(title), stacks).is_err() {
-                        log(&format!("menu for {viewer:032x} not opened"));
-                    } else if edit.is_some() {
-                        show(host, viewer, Text::literal("View only on this server: changes are not saved."), false);
+                    match host.open_menu(viewer, rows, Text::literal(title), stacks, MenuReplace::CloseFirst) {
+                        Ok(Some(window)) => {
+                            if let Some(edit) = edit {
+                                self.edit_menus.lock().unwrap_or_else(|e| e.into_inner()).push(EditMenu {
+                                    viewer,
+                                    window,
+                                    edit,
+                                    rows,
+                                    items,
+                                    changed: false,
+                                    drag: None,
+                                });
+                            }
+                        }
+                        Ok(None) | Err(_) => log(&format!("menu for {viewer:032x} not opened")),
                     }
                 }
             }
         }
     }
 
+    // The clicks of an editable `/inventory` or `/enderchest` menu (`InventoryCommand` lets its viewer
+    // take and put items); the menu moves nothing itself, so they are carried out here.
+    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+        let rows = {
+            let menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+            match menus.iter().find(|m| m.viewer == event.uuid && m.window == event.window) {
+                Some(m) => m.rows,
+                None => return,
+            }
+        };
+        let own = usize::from(rows) * 9;
+        let slot = usize::try_from(event.slot).ok().filter(|s| *s < own + 36);
+        // A drag is collected over its start, its added slots and its end (mode 5); the end carries it out.
+        let drag = if event.mode == 5 { self.drag_step(event.uuid, event.window, event.button, slot) } else { None };
+        let Some(menu) = host.menu(event.uuid, event.window) else {
+            return;
+        };
+        let moved = match (event.mode, drag, slot) {
+            (5, Some(drag), _) => drag_carry(host, menu, &drag),
+            (5, None, _) => false,
+            (_, _, Some(slot)) => edit_click(host, menu, event.uuid, own, slot, event.button, event.mode),
+            _ => false,
+        };
+        if !moved {
+            return;
+        }
+        let items = menu_items(host, menu, rows);
+        let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = menus.iter_mut().find(|m| m.viewer == event.uuid && m.window == event.window) {
+            m.items = items;
+            m.changed = true;
+        }
+    }
+
+    // The viewer closed an editable menu (or it was replaced, or they left): the new contents become a snapshot.
+    fn menu_closed(&self, _: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+        let closed = {
+            let mut menus = self.edit_menus.lock().unwrap_or_else(|e| e.into_inner());
+            menus.iter().position(|m| m.viewer == event.uuid && m.window == event.window).map(|i| menus.remove(i))
+        };
+        if let Some(menu) = closed {
+            if menu.changed {
+                core::on_menu_edited(menu.edit, menu.items);
+            }
+        }
+    }
+
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        for (node, level) in permission_nodes() {
+            let _ = event.nodes.add(
+                boolean_node(&node),
+                NodeDefault::Level(PermissionLevel::from_level(i32::from(level))),
+            );
+        }
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // The public usages (`horizonsync`, `horizonsync about`) and the console-only ones (level 4) are open.
-        // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): the engine
-        // leaves it out of the tab list of a player without the node (as Bukkit hides a command whose node the
-        // sender lacks), and `player_command` answers the typed line with HuskSync's own denial.
+        // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): see
+        // register_node_commands. `player_command` answers the typed line with HuskSync's own denial.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
             let usage = usage.replace(":player_name>", ":word>");
@@ -708,9 +1165,21 @@ impl Hooks for Mod {
                 continue;
             }
             let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
-            match core::permission_for(&literals.join(" ")) {
-                Some((node, _)) => event.commands.push(Command::op(&usage, level).with_node(&node)),
-                None => event.commands.push(Command::new(&usage)),
+            if core::permission_for(&literals.join(" ")).is_none() {
+                event.commands.push(Command::new(&usage));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
+        for (usage, level) in core::command_usages() {
+            let usage = usage.replace(":player_name>", ":word>");
+            if level == 0 || level >= 4 {
+                continue;
+            }
+            let literals: Vec<&str> = usage.split_whitespace().take_while(|w| !w.starts_with('<') && !w.starts_with('[')).collect();
+            if let Some((node, _)) = core::permission_for(&literals.join(" ")) {
+                event.commands.push(Command::op(&usage, level).with_node(&boolean_node(&node)));
             }
         }
     }
@@ -723,36 +1192,40 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         let line = command_line(&*host, &event.command);
-        let Some((node, required)) = core::permission_for(&line) else {
+        let Some((node, _)) = core::permission_for(&line) else {
             return Flow::Continue;
         };
         let edit_node = core::edit_permission_for(&line);
-        let (uuid, name, granted, edit) = match &event.source {
+        let (uuid, name, granted, edit, edit_all, dump) = match &event.source {
             CommandSource::Player { player, .. } => {
-                // The `about` node (level 0) is open to everyone unless a permissions mod says otherwise.
-                let granted = if required == 0 {
-                    player.permission_value(&*host, &node).unwrap_or(true)
-                } else {
-                    player.has_permission(&*host, &node)
+                // The node's default (`permission_gather_nodes`) decides unless the handler answers; the
+                // bare command defaults to everyone. Any error is a denial.
+                let mut has = |n: &str| player.permission_bool(&mut *host, &boolean_node(n)).unwrap_or(false);
+                let granted = has(&node);
+                let edit = match &edit_node {
+                    Some(n) => has(n),
+                    None => false,
                 };
-                let edit = edit_node.as_deref().is_some_and(|n| player.has_permission(&*host, n));
-                (Some(player.uuid()), player.name(&*host).unwrap_or_default(), granted, edit)
+                // `/userdata view` shows the item buttons to who may edit both, the dump buttons to who may dump.
+                let edit_all = has("husksync.command.inventory.edit") && has("husksync.command.enderchest.edit");
+                let dump = has("husksync.command.userdata.dump");
+                (Some(player.uuid()), player.name(&*host).unwrap_or_default(), granted, edit, edit_all, dump)
             }
-            CommandSource::Console { .. } => (None, "CONSOLE".to_string(), true, edit_node.is_some()),
-            // Command blocks and functions are not HorizonSync's senders.
+            CommandSource::Console { .. } => (None, "CONSOLE".to_string(), true, edit_node.is_some(), true, true),
+            // Command blocks and functions are not HuskSync's senders.
             _ => return Flow::Cancel,
         };
         // The core refuses a player below its operator level (2): 4 when the node is granted, 0 when
         // not, so the core answers the denial itself.
         let level = if granted { 4 } else { 0 };
-        let sender = core::Sender { uuid, name, level, edit };
+        let sender = core::Sender { uuid, name, level, edit, edit_all, dump };
         if core::perform_command(sender, &line) {
             return Flow::Cancel;
         }
         // Off (`enabled` not `true`): answer instead of "unknown command".
         if !core::is_running() {
             let _ = host.commands().feedback(Text::literal(
-                "HorizonSync is switched off on this server (enabled = false). Nothing was run.",
+                "HuskSync is switched off on this server (enabled = false). Nothing was run.",
             ));
             return Flow::Cancel;
         }
@@ -779,13 +1252,66 @@ impl Hooks for Mod {
         if required == 0 {
             return Flow::Continue;
         }
-        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        let allowed = match host.player(event.player) {
+            Some(p) => p.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false),
+            None => false,
+        };
         if allowed {
             return Flow::Continue;
         }
         event.cancelled = true;
-        event.replies.push(Text::literal("Error: You do not have permission to execute this command"));
+        for line in core::locale_lines("error_no_permission", &[]) {
+            let text = match host.text_from_json(&line.component.to_string()) {
+                Ok(Some(text)) => text,
+                _ => Text::literal(line.plain),
+            };
+            event.replies.push(text);
+        }
         Flow::Cancel
+    }
+
+    // Save on death (HuskSync's `saveOnPlayerDeath`) with `items_to_save: DROPS`: the stacks the player
+    // drops. A locked player drops nothing (`cancelPlayerEvent` clears the drops).
+    fn living_drops(&self, host: &mut dyn ServerHost, event: &mut LivingDropsEvent<'_>) -> Flow {
+        let Some(player) = event.player else {
+            return Flow::Continue;
+        };
+        if !core::running() {
+            return Flow::Continue;
+        }
+        if core::is_locked(player) {
+            event.drops.clear();
+            return Flow::Continue;
+        }
+        // `BukkitEventListener.handlePlayerDeath`: with save_on_death on, the drops past the inventory's slots are
+        // removed from the event before the snapshot is taken, so they are not dropped in the world either.
+        if let Some(limit) = core::death_drop_limit() {
+            event.drops.truncate(limit);
+        }
+        if core::death_saves_kept_items() {
+            return Flow::Continue;
+        }
+        let items = stored_items(&*host, event.drops.iter().map(|drop| &drop.stack));
+        if let Some(nbt) = read_player(host, player) {
+            core::on_death(player, &nbt, items);
+        }
+        Flow::Continue
+    }
+
+    // `items_to_save: ITEMS_TO_KEEP`: what the player keeps, which is the whole inventory when
+    // `keep_inventory` is on and nothing otherwise (Paper's `getItemsToKeep`). The inventory is still
+    // intact where `ServerPlayer.die` starts.
+    fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
+        if !core::running() || !core::death_saves_kept_items() {
+            return;
+        }
+        let Some(nbt) = read_player(host, event.player) else {
+            return;
+        };
+        let keep = matches!(host.game_rule("keep_inventory"), Ok(GameRuleValue::Bool(true)));
+        let items: Vec<core::StoredItem> =
+            if keep { core::player::inventory_slots(&nbt).into_iter().flatten().collect() } else { Vec::new() };
+        core::on_death(event.player, &nbt, items);
     }
 
     // ----- the lock while a player's data loads (BukkitLockedEventListener) -----
@@ -822,8 +1348,14 @@ impl Hooks for Mod {
         acting_flow(&*host)
     }
 
-    fn entity_interact(&self, host: &mut dyn ServerHost, _: &mut EntityInteractEvent<'_>) -> Flow {
-        acting_flow(&*host)
+    fn entity_interact(&self, host: HostSide<'_>, _: &mut EntityInteractEvent<'_>) -> Option<InteractionResult> {
+        match host {
+            HostSide::Server(host) => match acting_flow(&*host) {
+                Flow::Cancel => Some(InteractionResult::Fail),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn armor_stand_manipulate(&self, host: &mut dyn ServerHost, _: &mut ArmorStandManipulateEvent<'_>) -> Flow {
@@ -841,14 +1373,84 @@ impl Hooks for Mod {
         acting_flow(&*host)
     }
 
-    fn item_toss(&self, host: &mut dyn ServerHost, _: &mut ItemTossEvent<'_>) -> Flow {
+    fn item_toss(&self, host: &mut dyn ServerHost, _: &mut ItemTossEvent) -> Flow {
         acting_flow(&*host)
     }
 
-    // TODO(arismoko-api: living_incoming_damage victim): locked players can still take damage; the
-    // damage hook names the victim as an entity, and mapping it to a player needs more than the hook gives.
-    // TODO(arismoko-api: projectile_launch_cancel): a locked player's ender pearl or arrow is not refused
-    // (player_launch_projectile only listens).
-    // TODO(arismoko-api: menu_input_closed): the editable /inventory and /enderchest menus; menu_closed
-    // carries no slots, so an edit cannot be taken (the menu opens read-only, see Action::OpenMenu).
+    // A locked player takes no damage (`BukkitLockedEventListener.onPlayerTakeDamage`). The core keeps the
+    // entity ids of the locked players (`tick`).
+    fn living_incoming_damage(&self, _: &mut dyn LevelRandomHost, event: &mut LivingIncomingDamageEvent<'_>) -> Flow {
+        if event.kind == "minecraft:player" && core::is_locked_entity(event.entity) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    // A locked player launches no projectile (`onProjectileLaunch`). `player_launch_projectile` and `projectile_launch`
+    // only listen, after the projectile exists, so the use that would launch it is refused instead: `right_click_item`
+    // cancels before `Item.use` for the items that launch one (ender pearls stay allowed with
+    // `allow_pearl_spawning_while_locked`, `core::refuse_launch`). Projectiles from dispensers or a mob are no player's.
+    fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
+        let HostSide::Server(host) = host else { return Flow::Continue };
+        let item = event.click.stack.item().id(&*host);
+        if LAUNCHING_ITEMS.contains(&item.as_str()) && core::refuse_launch(event.click.player, item.as_str()) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    // HMOD-GAP(locked-inventory-click): no hook answers a click in the player's own inventory screen, which
+    // `BukkitLockedEventListener.onInventoryClick` cancels; only `container_opened` is refused.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statistics_become_the_vanilla_document_and_back() {
+        let doc = statistics_document(&[
+            ("minecraft:mined", "minecraft:stone".into(), 5),
+            ("minecraft:custom", "minecraft:jump".into(), 3),
+            ("minecraft:mined", "minecraft:dirt".into(), 1),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(v["stats"]["minecraft:mined"]["minecraft:stone"], 5);
+        assert_eq!(v["stats"]["minecraft:mined"]["minecraft:dirt"], 1);
+        assert_eq!(v["stats"]["minecraft:custom"]["minecraft:jump"], 3);
+        assert_eq!(statistics_document(&[]), r#"{"stats":{}}"#);
+        let updates = statistic_updates(&v);
+        assert_eq!(updates.len(), 3);
+        assert!(updates.contains(&(StatType::Custom, "minecraft:jump".to_owned(), 3)));
+        assert!(updates.contains(&(StatType::Mined, "minecraft:stone".to_owned(), 5)));
+    }
+
+    #[test]
+    fn updates_skip_what_the_game_cannot_take() {
+        let plan = serde_json::json!({ "stats": {
+            "minecraft:used": { "minecraft:bread": 2, "minecraft:neg": -1, "minecraft:huge": 99999999999i64 },
+            "minecraft:unknown": { "minecraft:x": 1 }
+        }, "DataVersion": 5023 });
+        assert_eq!(statistic_updates(&plan), vec![(StatType::Used, "minecraft:bread".to_owned(), 2)]);
+        assert!(statistic_updates(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn menu_clicks_carried_out_are_the_vanilla_kinds_with_their_buttons() {
+        assert!(carried_click(0, 0) && carried_click(0, 1));
+        assert!(carried_click(1, 0) && carried_click(1, 1));
+        assert!(!carried_click(0, 2));
+        assert!(carried_click(2, 0) && carried_click(2, 8) && carried_click(2, 40));
+        assert!(!carried_click(2, 9) && !carried_click(2, 39));
+        assert!(carried_click(6, 0) && !carried_click(6, 1));
+        assert!(!carried_click(4, 0), "throws are not carried out");
+        assert!(!carried_click(3, 2), "the middle button is not carried out");
+    }
+
+    #[test]
+    fn drag_shares_the_cursor_evenly_on_a_left_drag_and_one_each_on_a_right_one() {
+        assert_eq!(drag_share(10, 3, true), 3);
+        assert_eq!(drag_share(10, 3, false), 1);
+        assert_eq!(drag_share(2, 3, true), 0);
+        assert_eq!(drag_share(5, 0, true), 0);
+        assert_eq!(drag_share(64, 4, true), 16);
+    }
 }

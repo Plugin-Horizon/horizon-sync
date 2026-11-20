@@ -8,8 +8,8 @@
 //!  "data":{"husksync:inventory":"<SNBT>","husksync:health":"<JSON>", ...}}
 //! ```
 
-use crate::snappy;
-use crate::util::{self, compare_versions};
+use crate::horizonsync_core::snappy;
+use crate::horizonsync_core::util::{self, compare_versions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use indexmap::IndexMap;
@@ -332,10 +332,10 @@ mod tests {
         let compressed = s.to_bytes(true);
         assert_eq!(Packed::from_bytes(&compressed, true).unwrap().to_json(), json);
 
-        let inv = crate::data::Inventory::deserialize(&s.data[keys::INVENTORY], 5023).unwrap();
+        let inv = crate::horizonsync_core::data::Inventory::deserialize(&s.data[keys::INVENTORY], 5023).unwrap();
         assert_eq!(inv.slots.len(), 43);
         assert_eq!(inv.serialize(), inventory);
-        let e = crate::data::EnderChest::deserialize(&s.data[keys::ENDER_CHEST], 5023).unwrap();
+        let e = crate::horizonsync_core::data::EnderChest::deserialize(&s.data[keys::ENDER_CHEST], 5023).unwrap();
         assert_eq!(e.slots.len(), 27);
         assert_eq!(e.serialize(), ender);
     }
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(s.format_version, 0);
         assert_eq!(s.validate(&platform()), Err(Invalid::Legacy));
         // Compressed the same way.
-        let packed = crate::snappy::compress(json);
+        let packed = crate::horizonsync_core::snappy::compress(json);
         let s = Packed::from_bytes(&packed, true).unwrap();
         assert_eq!(s.validate(&platform()), Err(Invalid::Legacy));
         // Not JSON at all is still an error.

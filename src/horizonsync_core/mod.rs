@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 /// The config written on first start.
-pub const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
+pub const DEFAULT_CONFIG: &str = include_str!("../../data/husksync/config.example.toml");
 
 static ENGINE: OnceLock<Arc<Engine>> = OnceLock::new();
 
@@ -82,6 +82,31 @@ pub fn on_leave(player: u128, compound: &Nbt) {
     if let Some(e) = engine() {
         e.on_leave(player, compound);
     }
+}
+
+/// A player died with `items` (their drops, or the stacks they keep) and `compound` as their data
+/// (`PlayerDeathEvent`): the DEATH snapshot, when `save_on_death` is on.
+pub fn on_death(player: u128, compound: &Nbt, items: Vec<StoredItem>) {
+    if let Some(e) = engine() {
+        e.on_death(player, compound, items);
+    }
+}
+
+/// With `save_on_death` on and `items_to_save: DROPS`: how many drops a death keeps (the inventory's slots).
+/// None otherwise, when the drops are left alone.
+pub fn death_drop_limit() -> Option<usize> {
+    let saves = engine().is_some_and(|e| e.cfg().synchronization.save_on_death.enabled);
+    (saves && !death_saves_kept_items()).then_some(engine::DEATH_INVENTORY_SLOTS)
+}
+
+/// What `save_on_death.items_to_save` says to save: true for `ITEMS_TO_KEEP`, false for `DROPS`.
+pub fn death_saves_kept_items() -> bool {
+    engine().is_some_and(|e| e.cfg().synchronization.save_on_death.items_to_save.eq_ignore_ascii_case("ITEMS_TO_KEEP"))
+}
+
+/// Whether the built-in data type `key` (`husksync:statistics`) is synchronised.
+pub fn feature_enabled(key: &str) -> bool {
+    engine().is_some_and(|e| e.cfg().synchronization.features.enabled(key))
 }
 
 /// The world saved (`WorldSaveEvent`): every player here with their compound.
@@ -157,7 +182,15 @@ pub fn is_running() -> bool {
     engine().is_some()
 }
 
-/// The permission node a command's registration names (`horizonsync.command.<command>`).
+/// The lines of a locale text (`error_no_permission`...): the running engine's file, else the built-in English.
+pub fn locale_lines(key: &str, args: &[&str]) -> Vec<messages::Line> {
+    match engine() {
+        Some(e) => e.cfg().messages.lines(key, args),
+        None => messages::Messages::default().lines(key, args),
+    }
+}
+
+/// The permission node a command's registration names (`husksync.command.<command>`).
 /// The node for editing the items of `/inventory` / `/enderchest`, if the line is one of those.
 pub fn edit_permission_for(line: &str) -> Option<String> {
     commands::edit_permission_for(line)

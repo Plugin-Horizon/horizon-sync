@@ -12,12 +12,30 @@
 //! Not supported (the tag is dropped, its text kept): `<reset>`, `<rainbow>`, `<transition>`,
 //! `<shadow>`, `<font>`, `<insertion>`, `<keybind>`, `<translate>`, `<newline>`, hover actions other
 //! than `show_text`, and click actions other than the four above. Legacy `&` codes are plain text.
-//! A real newline inside a block scalar (`|-`) becomes a space, as YAML folds it.
+//! A real newline inside a block scalar (`|-`) becomes a space in chat text, as YAML folds it, and a line
+//! break inside a hover text.
+//!
+//! The English texts are HuskSync 4.1.0's `locales/en-gb.yml`, embedded unchanged
+//! (`data/husksync/messages-en-gb.yml`); a `messages-<language>.yml` file overrides them key by key.
 
-use crate::yaml;
+use crate::horizonsync_core::yaml;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::OnceLock;
+
+/// HuskSync's English locale file, unchanged.
+const EN_GB: &str = include_str!("../../data/husksync/messages-en-gb.yml");
+
+/// The embedded English texts by key.
+fn embedded() -> &'static BTreeMap<String, String> {
+    static MAP: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| Messages::from_yaml(EN_GB).map(|m| m.locales).unwrap_or_default())
+}
+
+/// Marks a real line break of a template while it is parsed: text turns it into a space, a hover
+/// text into a line break.
+const BREAK: char = '\u{1}';
 
 /// The built-in English texts (`messages-en-gb.yml`'s values), used when the file is missing or has
 /// no such key. Only the keys this port sends are listed.
@@ -29,10 +47,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("user_registration_complete", "<color:#00fb9a>⭐ User registration complete!</color>"),
 ];
 
-/// The keys of `DEFAULTS`: the messages this port reads from the file (`check_original` reports the
+/// The keys of the locale file: the messages this port reads from it (`check_original` reports the
 /// others as not read).
 pub fn used_keys() -> impl Iterator<Item = &'static str> {
-    DEFAULTS.iter().map(|(k, _)| *k)
+    embedded().keys().map(String::as_str)
 }
 
 /// The locale file's texts.
@@ -78,34 +96,47 @@ impl Messages {
         Ok(Messages { locales })
     }
 
-    /// The MiniMessage template for `key`: the file's, else the built-in one.
+    /// The MiniMessage template for `key`: the file's, else the embedded English one.
     pub fn template(&self, key: &str) -> Option<&str> {
         match self.locales.get(key) {
             Some(v) => Some(v.as_str()),
-            None => DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
+            None => match embedded().get(key) {
+                Some(v) => Some(v.as_str()),
+                None => DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
+            },
         }
     }
 
+    /// The template of `key` with `%1%`, `%2%`... replaced by `args`, still MiniMessage (HuskSync's
+    /// `getRawLocale`). None for an unknown key.
+    /// Commands are not namespaced on Horizon, so a click on `/husksync:userdata ...` runs `/userdata ...`.
+    pub fn raw(&self, key: &str, args: &[&str]) -> Option<String> {
+        self.template(key).map(|t| fill(&t.replace("/husksync:", "/"), args))
+    }
+
     /// The chat lines of `key` with `%1%`, `%2%`... replaced by `args`. Empty for an unknown key.
+    /// An empty line (a template that starts or ends with `\n`) is kept, as a blank chat line.
     pub fn lines(&self, key: &str, args: &[&str]) -> Vec<Line> {
-        let Some(template) = self.template(key) else { return Vec::new() };
-        let mut out = Vec::new();
-        for piece in template.split("\\n") {
-            let filled = fill(piece, args);
-            let segs = parse(&filled.replace(['\n', '\r'], " "));
-            let plain: String = segs.iter().map(|s| s.text.as_str()).collect();
-            if plain.is_empty() {
-                continue;
-            }
-            out.push(Line { plain, component: component(&segs) });
-        }
-        out
+        let Some(filled) = self.raw(key, args) else { return Vec::new() };
+        Messages::render(&filled)
+    }
+
+    /// The chat lines of a template that is already filled in (see [`Messages::raw`]).
+    pub fn render(filled: &str) -> Vec<Line> {
+        filled
+            .split("\\n")
+            .map(|piece| {
+                let segs = parse(&piece.replace(['\n', '\r'], &BREAK.to_string()));
+                let plain: String = segs.iter().map(|s| s.text.replace(BREAK, " ")).collect();
+                Line { plain, component: component(&segs) }
+            })
+            .collect()
     }
 }
 
 fn fill(template: &str, args: &[&str]) -> String {
     let mut out = template.to_owned();
-    for (i, arg) in args.iter().enumerate().take(9) {
+    for (i, arg) in args.iter().enumerate().take(12) {
         out = out.replace(&format!("%{}%", i + 1), arg);
     }
     out
@@ -384,7 +415,7 @@ fn component(segs: &[Seg]) -> Value {
 
 fn seg_json(seg: &Seg) -> Value {
     let mut m = Map::new();
-    m.insert("text".into(), Value::String(seg.text.clone()));
+    m.insert("text".into(), Value::String(seg.text.replace(BREAK, " ")));
     let s = &seg.style;
     if let Some(c) = &s.color {
         m.insert("color".into(), Value::String(c.clone()));
@@ -410,6 +441,13 @@ fn seg_json(seg: &Seg) -> Value {
     }
     if let Some(raw) = &s.hover {
         let inner = parse(raw);
+        let inner: Vec<Seg> = inner
+            .into_iter()
+            .map(|mut seg| {
+                seg.text = seg.text.replace(BREAK, "\n");
+                seg
+            })
+            .collect();
         m.insert("hover_event".into(), json!({ "action": "show_text", "value": component(&inner) }));
     }
     Value::Object(m)
@@ -522,5 +560,29 @@ mod tests {
         // A block scalar keeps its line breaks in the template; `lines` turns them into spaces.
         assert_eq!(m.template("reload_complete"), Some("<bold>HuskSync</bold> | Reloaded\n<italic>A restart is needed.</italic>"));
         assert_eq!(m.lines("reload_complete", &[])[0].plain, "HuskSync | Reloaded A restart is needed.");
+    }
+
+    #[test]
+    fn the_embedded_english_file_keeps_hovers_and_blank_lines() {
+        let m = Messages::default();
+        let deleted = m.lines("data_deleted", &["abc12345", "abc12345-0000", "Bob", "p-uuid"]);
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].plain, "❌ Successfully deleted user data snapshot abc12345 for Bob.");
+        assert!(deleted[0].component.to_string().contains("Version UUID:\\n"));
+        let title = m.lines("data_list_title", &["Bob", "1", "6", "20"]);
+        assert_eq!(title.iter().map(|l| l.plain.as_str()).collect::<Vec<_>>(), ["Bob's user data snapshots: (1-6 of 20)", ""]);
+        let footer = m.lines("list_footer", &["", "1", "3", "", "(1 2 3)"]);
+        assert_eq!(footer.iter().map(|l| l.plain.as_str()).collect::<Vec<_>>(), ["", "Page 1/3   (1 2 3)"]);
+        assert!(used_keys().any(|k| k == "data_list_item"));
+        assert_eq!(m.raw("data_manager_pinned", &[]).unwrap().contains("won\\'t"), true);
+    }
+
+    #[test]
+    fn clicks_do_not_use_the_namespaced_command() {
+        let m = Messages::default();
+        let line = m.lines("data_manager_management_buttons", &["Bob", "v1"]);
+        let json = line[0].component.to_string();
+        assert!(json.contains("\"command\":\"/userdata delete Bob v1\""));
+        assert!(!json.contains("husksync:"));
     }
 }

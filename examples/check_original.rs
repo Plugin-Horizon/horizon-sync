@@ -6,7 +6,7 @@
 //! the file name. A `config.yml` is loaded with `Config::from_huskysync` from its own folder, so
 //! its `server.yml` and locale file are used when they sit next to it.
 
-use horizonsync_core::{config, messages, yaml};
+use mod_husksync::horizonsync_core::{config, messages, yaml};
 use std::path::Path;
 
 fn main() {

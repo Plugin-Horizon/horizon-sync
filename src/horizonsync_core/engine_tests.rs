@@ -1,12 +1,12 @@
 //! The sync rules against an in-memory database and Redis (no server, no network).
 
-use crate::config::Config;
-use crate::db::Stored;
-use crate::engine::{Action, Cache, Engine, Store};
-use crate::nbt::parse_snbt;
-use crate::redis_mgr::{Message, MessageType};
-use crate::snapshot::{keys, Packed, Platform};
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::db::Stored;
+use crate::horizonsync_core::engine::{Action, Cache, Engine, Store};
+use crate::horizonsync_core::nbt::parse_snbt;
+use crate::horizonsync_core::redis_mgr::{Message, MessageType};
+use crate::horizonsync_core::snapshot::{keys, Packed, Platform};
+use crate::horizonsync_core::util;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -135,10 +135,15 @@ impl Cache for Arc<FakeRedis> {
 }
 
 fn setup(mode: &str) -> (Arc<Engine>, Arc<FakeDb>, Arc<FakeRedis>) {
+    setup_with(mode, |_| {})
+}
+
+fn setup_with(mode: &str, tweak: impl FnOnce(&mut Config)) -> (Arc<Engine>, Arc<FakeDb>, Arc<FakeRedis>) {
     let mut c = Config::default();
     c.server_name = HERE.into();
     c.synchronization.mode = mode.into();
     c.synchronization.network_latency_milliseconds = 100;
+    tweak(&mut c);
     let db = Arc::new(FakeDb::default());
     let redis = Arc::new(FakeRedis::default());
     let dir = std::env::temp_dir().join("horizonsync-core-tests");
@@ -311,6 +316,10 @@ fn locked_players_cannot_run_commands_and_world_save_skips_them() {
     redis.checkout.lock().unwrap().insert(P, "paper".into());
     e.on_join(P, "Alex");
     assert!(e.refuse_command(P, "spawn"));
+    // The game tells the engine who is on each tick; a locked player's entity takes no damage.
+    e.tick(&[(P, 7), (P + 1, 8)]);
+    assert!(e.is_locked_entity(7));
+    assert!(!e.is_locked_entity(8));
     e.on_world_save(vec![(P, parse_snbt("{}").unwrap())]);
     std::thread::sleep(Duration::from_millis(200));
     assert!(db.sorted(P).is_empty());
@@ -334,9 +343,59 @@ fn server_stop_saves_everyone_unlocked_and_releases_checkouts() {
 
 #[test]
 fn locked_launch_rule_follows_husksync() {
-    use crate::engine::launch_refused;
+    use crate::horizonsync_core::engine::launch_refused;
     assert!(!launch_refused(false, "minecraft:snowball", false));
     assert!(launch_refused(true, "minecraft:snowball", true));
     assert!(!launch_refused(true, "minecraft:ender_pearl", true));
     assert!(launch_refused(true, "minecraft:ender_pearl", false));
+}
+
+fn stored_item(id: &str, count: i32) -> crate::horizonsync_core::StoredItem {
+    crate::horizonsync_core::StoredItem {
+        item: parse_snbt(&format!("{{id:\"{id}\",count:{count}}}")).unwrap(),
+        data_version: 5023,
+    }
+}
+
+#[test]
+fn a_death_saves_a_snapshot_with_the_dropped_items_only_when_enabled() {
+    // Off by default: nothing is saved.
+    let (e, db, _) = setup("LOCKSTEP");
+    e.on_join(P, "Alex");
+    run_until(&e, 3, |a| matches!(a, Action::Component { .. }).then_some(()));
+    let compound = parse_snbt("{playerGameType:0,Health:0.0f,SelectedItemSlot:4}").unwrap();
+    e.on_death(P, &compound, vec![stored_item("minecraft:stone", 3)]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(db.sorted(P).is_empty());
+
+    let (e, db, _) = setup_with("LOCKSTEP", |c| c.synchronization.save_on_death.enabled = true);
+    e.on_join(P, "Alex");
+    run_until(&e, 3, |a| matches!(a, Action::Component { .. }).then_some(()));
+    e.on_death(P, &compound, vec![stored_item("minecraft:stone", 3), stored_item("minecraft:apple", 1)]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while db.sorted(P).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rows = db.sorted(P);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].save_cause, "DEATH");
+    let inv = &rows[0].data[keys::INVENTORY];
+    assert!(inv.contains("minecraft:stone") && inv.contains("minecraft:apple"));
+    let parsed = crate::horizonsync_core::data::Inventory::deserialize(inv, 5023).unwrap();
+    assert_eq!(parsed.held_item_slot, 4, "setContents keeps the held slot");
+    assert_eq!(parsed.slots.len(), crate::horizonsync_core::data::INVENTORY_SLOTS);
+    assert!(parsed.slots[0].is_some() && parsed.slots[1].is_some() && parsed.slots[2].is_none());
+}
+
+#[test]
+fn a_death_with_nothing_to_save_follows_save_empty_items() {
+    let (e, db, _) = setup_with("LOCKSTEP", |c| {
+        c.synchronization.save_on_death.enabled = true;
+        c.synchronization.save_on_death.save_empty_items = false;
+    });
+    e.on_join(P, "Alex");
+    run_until(&e, 3, |a| matches!(a, Action::Component { .. }).then_some(()));
+    e.on_death(P, &parse_snbt("{Health:0.0f}").unwrap(), Vec::new());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(db.sorted(P).is_empty());
 }

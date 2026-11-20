@@ -8,10 +8,11 @@
 //! `husksync:::request_user_data`, `husksync:::return_user_data`, `husksync:::check_in_petition`.
 //! Messages are Gson JSON: `{"targetServer":..,"target_uuid":..,"payload":[signed bytes]}`.
 
-use crate::config::Config;
-use crate::snapshot::Packed;
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::snapshot::Packed;
+use crate::horizonsync_core::util;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// `RedisManager.KEY_NAMESPACE` (with its trailing colon, which the format doubles).
@@ -134,13 +135,64 @@ fn percent(s: &str) -> String {
 }
 
 pub struct Redis {
-    client: redis::Client,
+    link: Link,
     cluster: String,
     server: String,
     compress: bool,
     max_retries: u32,
     backoff: Duration,
     timeout: Duration,
+}
+
+/// How the port reaches Redis: the host from `redis.credentials`, or (with a `redis.sentinel.master`) the
+/// primary the sentinels name (Lettuce's sentinel URI in HuskSync). The sentinel client needs `&mut` to ask
+/// for a connection, hence the lock.
+enum Link {
+    Direct(redis::Client),
+    Sentinel(Mutex<redis::sentinel::SentinelClient>),
+}
+
+/// The `user:password@` part of a Redis URL (empty when neither is set).
+fn auth_part(user: &str, password: &str) -> String {
+    match (user.is_empty(), password.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!(":{}@", percent(password)),
+        (false, true) => format!("{}@", percent(user)),
+        (false, false) => format!("{}:{}@", percent(user), percent(password)),
+    }
+}
+
+/// The sentinel client for `redis.sentinel`: each node is `host:port` (HuskSync splits on the colon), with the
+/// sentinel password when one is set; the primary is asked for with the credentials and database, and TLS
+/// when `redis.credentials.use_ssl` is on.
+fn sentinel_client(config: &Config) -> Result<redis::sentinel::SentinelClient, String> {
+    let r = &config.redis;
+    let s = &r.sentinel;
+    let scheme = if r.use_ssl { "rediss" } else { "redis" };
+    let node_auth = if s.password.is_empty() { String::new() } else { format!(":{}@", percent(&s.password)) };
+    let nodes: Vec<String> = s
+        .nodes
+        .iter()
+        .map(|node| format!("{scheme}://{node_auth}{}/", node.trim()))
+        .collect();
+    let mut primary = redis::RedisConnectionInfo::default().set_db(r.database);
+    if !r.user.is_empty() {
+        primary = primary.set_username(&r.user);
+    }
+    if !r.password.is_empty() {
+        primary = primary.set_password(&r.password);
+    }
+    let mut node_info = redis::sentinel::SentinelNodeConnectionInfo::default().set_redis_connection_info(primary);
+    if r.use_ssl {
+        node_info = node_info.set_tls_mode(redis::TlsMode::Secure);
+    }
+    redis::sentinel::SentinelClient::build(
+        nodes,
+        s.master.trim().to_owned(),
+        Some(node_info),
+        redis::sentinel::SentinelServerType::Master,
+    )
+    .map_err(|e| format!("redis sentinel: {e}"))
 }
 
 fn bytes_of(v: redis::Value) -> Option<Vec<u8>> {
@@ -155,19 +207,17 @@ fn bytes_of(v: redis::Value) -> Option<Vec<u8>> {
 impl Redis {
     pub fn connect(config: &Config, server_name: &str) -> Result<Redis, String> {
         let r = &config.redis;
-        if r.use_ssl {
-            return Err("redis.use_ssl is not supported by this port (the redis crate is built without TLS)".into());
-        }
-        let auth = match (r.user.is_empty(), r.password.is_empty()) {
-            (true, true) => String::new(),
-            (true, false) => format!(":{}@", percent(&r.password)),
-            (false, true) => format!("{}@", percent(&r.user)),
-            (false, false) => format!("{}:{}@", percent(&r.user), percent(&r.password)),
+        let link = if r.sentinel.master.trim().is_empty() {
+            // `rediss://` is TLS with the system's certificates (`tls-rustls`), as HuskSync's `useSSL`.
+            let scheme = if r.use_ssl { "rediss" } else { "redis" };
+            let auth = auth_part(&r.user, &r.password);
+            let url = format!("{scheme}://{auth}{}:{}/{}", r.host, r.port, r.database);
+            Link::Direct(redis::Client::open(url.as_str()).map_err(|e| format!("redis: {e}"))?)
+        } else {
+            Link::Sentinel(Mutex::new(sentinel_client(config)?))
         };
-        let url = format!("redis://{auth}{}:{}/{}", r.host, r.port, r.database);
-        let client = redis::Client::open(url.as_str()).map_err(|e| format!("redis: {e}"))?;
         let me = Redis {
-            client,
+            link,
             cluster: config.cluster_id.clone(),
             server: server_name.to_owned(),
             compress: config.synchronization.compress_data,
@@ -184,10 +234,14 @@ impl Redis {
     }
 
     fn connection(&self) -> Result<redis::Connection, String> {
-        let c = self
-            .client
-            .get_connection_with_timeout(self.timeout)
-            .map_err(|e| format!("redis: {e}"))?;
+        let c = match &self.link {
+            Link::Direct(client) => client.get_connection_with_timeout(self.timeout),
+            Link::Sentinel(sentinel) => {
+                let mut sentinel = sentinel.lock().unwrap_or_else(|e| e.into_inner());
+                sentinel.get_connection()
+            }
+        }
+        .map_err(|e| format!("redis: {e}"))?;
         let _ = c.set_read_timeout(Some(self.timeout));
         let _ = c.set_write_timeout(Some(self.timeout));
         Ok(c)
@@ -353,7 +407,7 @@ impl Redis {
     pub fn listen(&self, stop: &dyn Fn() -> bool, on_message: &dyn Fn(MessageType, Message)) {
         let channels: Vec<String> = MessageType::ALL.iter().map(|t| t.channel(&self.cluster)).collect();
         while !stop() {
-            let mut con = match self.client.get_connection_with_timeout(self.timeout) {
+            let mut con = match self.connection() {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn!("horizonsync: redis subscribe: {e}");

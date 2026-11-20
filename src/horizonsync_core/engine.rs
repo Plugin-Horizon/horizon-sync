@@ -5,15 +5,15 @@
 //! `tick`...), the engine does the database and Redis work on worker threads, and hands back
 //! [`Action`]s for the game's thread: apply this plan, capture that player, show this line.
 
-use crate::config::Config;
-use crate::data::{self, EnderChest, Inventory, StoredItem};
-use crate::snapshot::keys;
-use crate::db::{usable, Db, Stored};
-use crate::nbt::Nbt;
-use crate::player::{self, ApplyPlan};
-use crate::redis_mgr::{Message, MessageType, Redis};
-use crate::snapshot::{Packed, Platform};
-use crate::util;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::data::{self, EnderChest, Inventory, StoredItem};
+use crate::horizonsync_core::snapshot::keys;
+use crate::horizonsync_core::db::{usable, Db, Stored};
+use crate::horizonsync_core::nbt::Nbt;
+use crate::horizonsync_core::player::{self, ApplyPlan};
+use crate::horizonsync_core::redis_mgr::{Message, MessageType, Redis};
+use crate::horizonsync_core::snapshot::{Packed, Platform};
+use crate::horizonsync_core::util;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,6 +101,9 @@ const SHUTDOWN_CRITICAL_CAUSES: [&str; 2] = ["SERVER_SHUTDOWN", "DISCONNECT"];
 const SHUTDOWN_CRITICAL_DB_ATTEMPTS: u32 = 3;
 const SHUTDOWN_CRITICAL_DB_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const TICK: Duration = Duration::from_millis(50);
+/// `BukkitData.Items.Inventory.INVENTORY_SLOT_COUNT`: a death snapshot keeps at most this many stacks.
+/// The inventory's slots with the armour and off hand (`Data.Items.Inventory.INVENTORY_SLOT_COUNT`).
+pub const DEATH_INVENTORY_SLOTS: usize = 41;
 
 /// `DataSnapshot.UpdateCause`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,8 +201,12 @@ pub struct Engine {
 /// Who runs a command.
 #[derive(Clone, Debug)]
 pub struct Sender {
-    /// May edit the items in `/inventory` and `/enderchest` (`horizonsync.command.*.edit`).
+    /// May edit the items in `/inventory` and `/enderchest` (`husksync.command.*.edit`).
     pub edit: bool,
+    /// Holds both edit nodes: `/userdata view` then shows the inventory and Ender Chest buttons.
+    pub edit_all: bool,
+    /// Holds `husksync.command.userdata.dump`: `/userdata view` then shows the system buttons.
+    pub dump: bool,
     /// None: the console.
     pub uuid: Option<u128>,
     pub name: String,
@@ -279,6 +286,20 @@ impl Engine {
         let lines = self.cfg().messages.lines(key, &[]);
         for line in lines {
             self.push(Action::Component { player: Some(player), text: line.plain, json: line.component, overlay });
+        }
+    }
+
+    /// A message of the locale file (`key`) with `args`, to a player (one chat line per line, with its
+    /// colours, hovers and clicks) or to the console (plain words, in the log).
+    pub(crate) fn say(&self, player: Option<u128>, key: &str, args: &[&str]) {
+        let lines = self.cfg().messages.lines(key, args);
+        self.say_lines(player, lines);
+    }
+
+    /// Chat lines already rendered from a template (`Messages::render`).
+    pub(crate) fn say_lines(&self, player: Option<u128>, lines: Vec<crate::horizonsync_core::messages::Line>) {
+        for line in lines {
+            self.push(Action::Component { player, text: line.plain, json: line.component, overlay: false });
         }
     }
 
@@ -633,15 +654,20 @@ impl Engine {
     }
 
     /// `DataSyncer.saveCurrentUserData`'s save part, for a snapshot already taken.
-    fn save_current(self: &Arc<Self>, player: u128, snapshot: Packed, reply: Option<(Option<u128>, String)>) {
+    fn save_current(
+        self: &Arc<Self>,
+        player: u128,
+        snapshot: Packed,
+        reply: Option<(Option<u128>, Vec<crate::horizonsync_core::messages::Line>)>,
+    ) {
         self.spawn(true, move |me| {
             me.persist(player, &snapshot);
             let critical = SHUTDOWN_CRITICAL_CAUSES.contains(&snapshot.save_cause.as_str());
             if !me.redis.set_user_data(player, &snapshot) && critical {
                 me.redis.clear_user_data(player);
             }
-            if let Some((to, text)) = reply {
-                me.tell(to, text);
+            if let Some((to, lines)) = reply {
+                me.say_lines(to, lines);
             }
         });
     }
@@ -662,6 +688,28 @@ impl Engine {
             let s = self.snapshot_of(player, &compound, "WORLD_SAVE");
             self.save_current(player, s, None);
         }
+    }
+
+    /// `EventListener.saveOnPlayerDeath`: a DEATH snapshot of the player's data with `items` (what they
+    /// dropped, or what they keep, as `items_to_save` says) as the inventory's contents. Not put to
+    /// Redis: the state is not one the player will be in after respawning. Nothing when the setting is
+    /// off, the player is locked, or there is nothing to save and `save_empty_items` is off.
+    pub fn on_death(self: &Arc<Self>, player: u128, compound: &Nbt, items: Vec<StoredItem>) {
+        let settings = self.cfg().synchronization.save_on_death.clone();
+        if self.is_locked(player) || !settings.enabled || (!settings.save_empty_items && items.is_empty()) {
+            return;
+        }
+        let mut snapshot = self.snapshot_of(player, compound, "DEATH");
+        if let Some(old) = snapshot.data.get(keys::INVENTORY) {
+            let fallback = util::data_version_of(&snapshot.minecraft_version);
+            // `setContents` replaces the stacks and keeps the held slot.
+            let held = Inventory::deserialize(old, fallback).map_or(0, |i| i.held_item_slot);
+            let mut slots: Vec<Option<StoredItem>> =
+                items.into_iter().take(DEATH_INVENTORY_SLOTS).map(Some).collect();
+            slots.resize(data::INVENTORY_SLOTS, None);
+            snapshot.data.insert(keys::INVENTORY.to_owned(), Inventory { slots, held_item_slot: held }.serialize());
+        }
+        self.spawn(true, move |me| me.persist(player, &snapshot));
     }
 
     /// `EventListener.handlePluginDisable`: SERVER_SHUTDOWN saves for everyone still unlocked,
@@ -808,9 +856,9 @@ impl Engine {
             let to = Some(edit.viewer);
             let latest = match me.db.latest_snapshot(edit.target) {
                 Ok(Some(s)) => s.snapshot,
-                _ => return me.tell(to, "Error: Could not find any user data to display."),
+                _ => return me.say(to, "error_no_data_to_display", &[]),
             };
-            let mut s = match crate::db::usable(latest, &me.platform) {
+            let mut s = match crate::horizonsync_core::db::usable(latest, &me.platform) {
                 Ok(s) => s.copy(),
                 Err(e) => return me.tell(to, format!("Error: {e}")),
             };
@@ -844,12 +892,11 @@ impl Engine {
     /// `/userdata save`: a SAVE_COMMAND snapshot of a player on this server.
     pub(crate) fn save_command(self: &Arc<Self>, player: u128, name: &str, reply_to: Option<u128>) {
         match self.capture_blocking(player, "SAVE_COMMAND") {
-            Some(s) => self.save_current(
-                player,
-                s,
-                Some((reply_to, format!("Successfully saved a snapshot of {name}'s current user data."))),
-            ),
-            None => self.tell(reply_to, "Error: Could not find a player by that name."),
+            Some(s) => {
+                let lines = self.cfg().messages.lines("data_saved", &[name]);
+                self.save_current(player, s, Some((reply_to, lines)))
+            }
+            None => self.say(reply_to, "error_invalid_player", &[]),
         }
     }
 

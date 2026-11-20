@@ -5,11 +5,11 @@
 //! Horizon snapshot says what a Paper one would for the same player. Applying gives the engine a
 //! plan, in HuskSync's dependency order; the engine side (`glue/horizonsync.rs`) carries it out.
 
-use crate::config::Config;
-use crate::data::{self, *};
-use crate::nbt::{parse_snbt, Nbt};
-use crate::records;
-use crate::snapshot::keys;
+use crate::horizonsync_core::config::Config;
+use crate::horizonsync_core::data::{self, *};
+use crate::horizonsync_core::nbt::{parse_snbt, Nbt};
+use crate::horizonsync_core::records;
+use crate::horizonsync_core::snapshot::keys;
 use indexmap::IndexMap;
 
 /// Horizon's own data version (`horizon_core::version::DATA_VERSION`, Minecraft 26.3).
@@ -112,9 +112,16 @@ pub fn capture(player: &Nbt, config: &Config, dimension_hint: Option<&str>) -> I
     let f = &config.synchronization.features;
     let mut out = IndexMap::new();
     if f.inventory {
-        let inv = Inventory {
-            slots: inventory_slots(player),
-            held_item_slot: player.i64_at("SelectedItemSlot").unwrap_or(0).clamp(0, 8) as i32,
+        // `BukkitUserDataHolder.getInventory`: a dead player has no inventory to sync unless
+        // `sync_dead_players_changing_server` is on.
+        let dead = player.f64_at("Health").is_some_and(|h| h <= 0.0);
+        let inv = if dead && !config.synchronization.save_on_death.sync_dead_players_changing_server {
+            Inventory { slots: vec![None; INVENTORY_SLOTS], held_item_slot: 0 }
+        } else {
+            Inventory {
+                slots: inventory_slots(player),
+                held_item_slot: player.i64_at("SelectedItemSlot").unwrap_or(0).clamp(0, 8) as i32,
+            }
         };
         out.insert(keys::INVENTORY.into(), inv.serialize());
     }
@@ -369,7 +376,7 @@ pub struct ApplyPlan {
 /// `DataSnapshot.Unpacked` + `Data.apply` for the types this port applies.
 pub fn plan(data: &IndexMap<String, String>, snapshot_mc_version: &str, config: &Config) -> ApplyPlan {
     let f = &config.synchronization.features;
-    let fallback = crate::util::data_version_of(snapshot_mc_version);
+    let fallback = crate::horizonsync_core::util::data_version_of(snapshot_mc_version);
     let mut p = ApplyPlan::default();
     let fail = |k: &str, e: String| p_skip(k, e);
     let mut skipped = Vec::new();
@@ -543,6 +550,24 @@ mod tests {
         assert_eq!(a.attributes[0].base_value, 24.0);
         assert_eq!(a.attributes[0].modifiers.len(), 1, "effect modifiers are ignored");
         assert_eq!(a.attributes[0].modifiers[0].operation, 2);
+    }
+
+    #[test]
+    fn a_dead_player_has_no_inventory_unless_dead_players_sync() {
+        let mut dead = player();
+        dead.put("Health", Nbt::Float(0.0));
+        let mut c = config(true);
+        let d = capture(&dead, &c, None);
+        let inv = Inventory::deserialize(&d[keys::INVENTORY], DATA_VERSION).unwrap();
+        assert!(inv.slots[0].is_some(), "dead players sync by default");
+        c.synchronization.save_on_death.sync_dead_players_changing_server = false;
+        let d = capture(&dead, &c, None);
+        let inv = Inventory::deserialize(&d[keys::INVENTORY], DATA_VERSION).unwrap();
+        assert!(inv.slots.iter().all(Option::is_none));
+        assert_eq!(inv.held_item_slot, 0);
+        // An alive player is not affected.
+        let d = capture(&player(), &c, None);
+        assert!(Inventory::deserialize(&d[keys::INVENTORY], DATA_VERSION).unwrap().slots[0].is_some());
     }
 
     #[test]
