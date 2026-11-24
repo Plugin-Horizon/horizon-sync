@@ -1397,8 +1397,15 @@ impl Hooks for Mod {
         }
     }
 
-    // HMOD-GAP(locked-inventory-click): no hook answers a click in the player's own inventory screen, which
-    // `BukkitLockedEventListener.onInventoryClick` cancels; only `container_opened` is refused.
+    // `BukkitLockedEventListener.onInventoryClick`: a locked player's click in their own inventory or a container is
+    // cancelled. Needs the `container_click` hook (engine main 7cb3ef30c3, not in the pinned SDK): behind `next-engine`.
+    // Unsure (blind): the event struct is `ContainerClickEvent` with `player: u128` and `cancelled: bool`.
+    #[cfg(feature = "next-engine")]
+    fn container_click(&self, _: &mut dyn ServerHost, event: &mut ContainerClickEvent<'_>) -> Flow {
+        if core::is_locked(event.player) { Flow::Cancel } else { Flow::Continue }
+    }
+    // HMOD-GAP(locked-inventory-click): without the `next-engine` feature no hook answers a click in the player's own
+    // inventory screen; only `container_opened` is refused.
 }
 
 #[cfg(test)]

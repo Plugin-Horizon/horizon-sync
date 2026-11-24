@@ -2,6 +2,8 @@
 
 ## Port status
 
+rec100 audit (2026-11-24): 17/25 items done, see audit/rec100/husksync.md; the cargo feature `next-engine` (off) adds the locked inventory click cancel and advancement sync for engine main.
+
 Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
 
 HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
