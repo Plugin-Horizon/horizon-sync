@@ -138,7 +138,7 @@ pub(crate) fn fire_sync_complete(player: u128, cause: &'static str) {
 // <value>` and `set_data_syncer <LOCKSTEP|DELAY>`.
 
 use crate::horizonsync_core::engine::Engine;
-use crate::horizonsync_core::snapshot::{keys, Packed};
+use crate::horizonsync_core::snapshot::keys;
 use crate::horizonsync_core::util;
 
 fn registered() -> &'static Mutex<Vec<String>> {
