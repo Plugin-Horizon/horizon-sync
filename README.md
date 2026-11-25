@@ -2,7 +2,7 @@
 
 ## Port status
 
-rec100 audit (2026-11-24): 17/25 items done, see audit/rec100/husksync.md; the cargo feature `next-engine` (off) adds the locked inventory click cancel and advancement sync for engine main.
+Round 2 (2026-11-25): 21/24 items done, see audit/rec100/husksync.md. Locked inventory click cancel, advancement sync, locked-map persistence, menu throws and the mc-logs dump upload are normal code now.
 
 Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
 
@@ -109,17 +109,12 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+Remaining gaps:
 
-- Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
-- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled. The advancement announcement of a locked player is still shown, and a quitting player's item on the cursor is not dropped (no hook cancels the announcement, and there is no item drop API).
-- Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
-- Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
-- `/husksync update` (no update checker, so no version answer), the mc-logs upload: `dump confirm` writes the status lines to `dumps/system_<time>.txt` instead, and `/userdata dump ... web` writes a file too. The `data_manager_status` line (the stock locale
-  misspells its key), POSTGRES/MONGO and map syncing (`persist_locked_maps`) are not implemented.
-- The editable menus carry out their clicks themselves (the game's chest menu moves nothing for a mod menu): pick up, put down, swap, shift-click, number keys, the off hand (F), double clicks and drags. Throws (Q, or a click outside the window) do nothing, as there is no item drop API. A hover text line break is kept only in hovers.
-- The DISCONNECT snapshot depends on hook order and is not fully verified.
-- Snapshot compatibility with the Java HuskSync plugin has to be checked on your data before you trust it: keep backups.
+- The advancement announcement of a locked player is not suppressed (`player_advancement_done_cancel` is in engine PR branch area-followups-2 only).
+- PostgreSQL and MongoDB are not supported (no driver; MariaDB/MySQL is what the rec servers use).
+- The Bukkit event API (PreSync, DataSave, SyncComplete) for other plugins does not exist (no Horizon cross-mod event bus).
+- Locked maps are saved in the map tables only; the Redis map caches are not written (they are a cache).
 
 ## Licence
 

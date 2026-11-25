@@ -9,6 +9,7 @@ pub mod config;
 pub mod data;
 pub mod db;
 pub mod engine;
+pub mod maps;
 pub mod messages;
 pub mod nbt;
 pub mod player;
@@ -139,6 +140,20 @@ pub fn applied(token: u64, ok: bool) {
 pub fn captured(token: u64, compound: Option<Nbt>) {
     if let Some(e) = engine() {
         e.captured(token, compound);
+    }
+}
+
+/// Saves the locked maps in `item` (and what it holds); a no-op when `persist_locked_maps` is off.
+pub fn persist_maps(item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+    if let Some(e) = engine() {
+        e.persist_maps(item, world);
+    }
+}
+
+/// Rebuilds the persisted locked maps in `item` on this server.
+pub fn apply_maps(item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+    if let Some(e) = engine() {
+        e.apply_maps(item, world);
     }
 }
 

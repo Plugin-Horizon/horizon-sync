@@ -197,6 +197,49 @@ impl Db {
         }
     }
 
+    /// `getMapData`, with the column's adapter stripped: the map file.
+    pub fn map_file(&self, server: &str, id: i32) -> Result<Option<Vec<u8>>, String> {
+        let mut c = self.conn()?;
+        let row: Option<Vec<u8>> = c
+            .exec_first(
+                self.q("SELECT `data` FROM `%map_data_table%` WHERE `server_name`=? AND `map_id`=? LIMIT 1;"),
+                (server, id),
+            )
+            .map_err(err)?;
+        Ok(row.and_then(|column| crate::horizonsync_core::maps::from_column(&column)))
+    }
+
+    /// `saveMapData`.
+    pub fn save_map_file(&self, server: &str, id: i32, file: &[u8]) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let column = crate::horizonsync_core::maps::to_column(file, self.compress);
+        c.exec_drop(
+            self.q("INSERT INTO `%map_data_table%` (`server_name`,`map_id`,`data`) VALUES (?,?,?);"),
+            (server, id, column),
+        )
+        .map_err(err)
+    }
+
+    /// `getBoundMapId`.
+    pub fn bound_map_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Result<Option<i32>, String> {
+        let mut c = self.conn()?;
+        c.exec_first(
+            self.q("SELECT `to_id` FROM `%map_ids_table%` WHERE `from_server_name`=? AND `from_id`=? AND `to_server_name`=? LIMIT 1;"),
+            (from_server, from_id, to_server),
+        )
+        .map_err(err)
+    }
+
+    /// `setMapBinding`.
+    pub fn set_map_binding(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) -> Result<(), String> {
+        let mut c = self.conn()?;
+        c.exec_drop(
+            self.q("INSERT INTO `%map_ids_table%` (`from_server_name`,`from_id`,`to_server_name`,`to_id`) VALUES (?,?,?,?);"),
+            (from_server, from_id, to_server, to_id),
+        )
+        .map_err(err)
+    }
+
     pub fn user_by_name(&self, name: &str) -> Result<Option<(u128, String)>, String> {
         let mut c = self.conn()?;
         let row: Option<(String, String)> = c

@@ -16,7 +16,7 @@ use horizonsync_core as core;
 use mod_api::{TriState,
     ArmorStandManipulateEvent, AttackEntityEvent, AttributeModifier, AttributeOperation, Identifier, ItemStack,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
-    CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
+    CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerClickEvent, ContainerOpenedEvent, EntityInteractEvent,
     EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
     GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LevelRandomHost,
     LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
@@ -203,15 +203,10 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`. That host call is in an open upstream
-    // pull request (gap-advancements), not in the pinned SDK, so it is behind the `horizon_advancements` cargo feature
-    // (off by default); without it a snapshot carries the advancements over unchanged.
-    #[cfg(feature = "horizon_advancements")]
-    {
-        if core::feature_enabled("husksync:advancements") {
-            if let Some(json) = player.advancements(&*host) {
-                nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
-            }
+    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`.
+    if core::feature_enabled("husksync:advancements") {
+        if let Some(json) = player.advancements(&*host) {
+            nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
         }
     }
     if core::feature_enabled("husksync:statistics") {
@@ -221,6 +216,14 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     }
     if let Some(data) = player.persistent_data(&*host) {
         nbt.put("NeoForgeData", to_core(&Tag::Compound(data)));
+    }
+    // `persist_locked_maps`: locked maps in the inventory and the ender chest keep their pixels in the map tables.
+    for list in ["Inventory", "EnderItems"] {
+        if let Some(core::Nbt::List(stacks)) = nbt.get_mut(list) {
+            for stack in stacks {
+                core::persist_maps(stack, &mut HostMaps { host: &mut *host });
+            }
+        }
     }
     core::player::mod_data_as_bukkit_values(&mut nbt);
     Some(nbt)
@@ -397,6 +400,36 @@ fn all_players(host: &mut dyn ServerHost) -> Vec<(u128, core::Nbt)> {
 /// cannot be applied: an item the game does not read, or an item saved with another data version
 /// (the engine has no item data fixer for mods, so an older or newer item is refused, never
 /// guessed at).
+/// The game side of the locked-map persistence: maps are looked up and made in the overworld
+/// (`Bukkit.getWorlds().get(0)`, `getDefaultMapWorld`).
+struct HostMaps<'a> {
+    host: &'a mut dyn ServerHost,
+}
+
+impl core::maps::MapWorld for HostMaps<'_> {
+    fn local(&mut self, id: i32) -> Option<core::maps::LocalMap> {
+        let level = self.host.level("minecraft:overworld")?;
+        let state = level.map_data(&*self.host, id)?;
+        Some(core::maps::LocalMap {
+            locked: state.locked,
+            pixels: core::maps::MapPixels {
+                colors: state.colors,
+                dimension: state.dimension,
+                scale: state.scale as i8,
+                x_center: state.center[0],
+                z_center: state.center[1],
+            },
+        })
+    }
+
+    fn create(&mut self, p: &core::maps::MapPixels) -> Option<i32> {
+        let level = self.host.level("minecraft:overworld")?;
+        let id = level.new_map(self.host, [p.x_center, p.z_center], 0, &p.colors)?;
+        let _ = level.set_map_locked(self.host, id, true);
+        Some(id)
+    }
+}
+
 fn stacks(host: &dyn ServerHost, slots: &[Option<core::StoredItem>]) -> Result<Vec<Option<ItemStack>>, String> {
     let version = host.server_data_version();
     slots
@@ -511,8 +544,8 @@ fn menu_items(host: &mut dyn ServerHost, menu: MenuRef, rows: u8) -> Vec<Option<
 
 /// The clicks this mod carries out in an editable menu (`ClickType` ids 0, 1, 2 and 6 with their buttons):
 /// a left or right pick up / put down / swap, a shift-click, a number key or off hand swap (button 40), and
-/// a double click. Drags (5) are carried out from their end; throws (4), the middle button (3) and the
-/// clicks outside the window (slot -999) are not.
+/// a double click. Drags (5) are carried out from their end and throws (4, and a click outside the window)
+/// by `throw_click`; the middle button (3) is not carried out.
 fn carried_click(mode: i32, button: i32) -> bool {
     match mode {
         0 | 1 => matches!(button, 0 | 1),
@@ -553,6 +586,64 @@ fn swap_places(host: &mut dyn ServerHost, tx: &mod_api::Transaction, a: &ItemPla
         ok &= a.insert(host, tx, resource, *count) == *count;
     }
     if ok { Ok(()) } else { Err(()) }
+}
+
+/// Throws in an editable menu (`ClickType.DROP` / `CONTROL_DROP`, and a click outside the window): the key
+/// drops one item of the slot (`button` 0) or the whole stack (1); a click outside drops the cursor's stack
+/// (button 0) or one item of it (1). The items leave the menu and are thrown by the viewer
+/// (`Player.drop(stack, false, true)`), and a refused toss gives them back. True when something moved.
+fn throw_click(host: &mut dyn ServerHost, menu: MenuRef, viewer: u128, slot: Option<usize>, button: i32, mode: i32) -> bool {
+    let (place, all) = match (mode, slot) {
+        (4, Some(slot)) => (ItemPlace::MenuSlot { menu, slot }, button == 1),
+        (0, None) if matches!(button, 0 | 1) => (menu.cursor(), button == 0),
+        _ => return false,
+    };
+    let Some(stack) = place.stack(host) else { return false };
+    let count = if all { stack.count() } else { 1 };
+    let resource = ItemResource::of(&stack);
+    let taken: Result<(), ()> = host.transaction(|host, tx| {
+        if place.extract(host, tx, &resource, count) == count { Ok(()) } else { Err(()) }
+    });
+    if taken.is_err() {
+        return false;
+    }
+    let mut thrown = stack;
+    if thrown.set_count(count).is_err() {
+        return false;
+    }
+    let Some(player) = host.player(viewer) else { return true };
+    match player.drop_stack(host, thrown, true) {
+        Ok(None) => {}
+        // A refused toss: the stack goes back where it came from.
+        Ok(Some(back)) => {
+            let _ = host.transaction(|host, tx| {
+                place.insert(host, tx, &ItemResource::of(&back), back.count());
+                Ok::<(), ()>(())
+            });
+        }
+        Err(_) => {}
+    }
+    true
+}
+
+/// `BukkitEventListener.handlePlayerQuit`: the stack on a leaving player's cursor is dropped where they stand
+/// (unless their data is still locked), so it is not lost with the menu.
+fn drop_cursor(host: &mut dyn ServerHost, uuid: u128) {
+    if core::is_locked(uuid) {
+        return;
+    }
+    let Some(player) = host.player(uuid) else { return };
+    let Some(menu) = player.container_menu(&*host) else { return };
+    let cursor = menu.cursor();
+    let Some(stack) = cursor.stack(host) else { return };
+    let resource = ItemResource::of(&stack);
+    let count = stack.count();
+    let taken: Result<(), ()> = host.transaction(|host, tx| {
+        if cursor.extract(host, tx, &resource, count) == count { Ok(()) } else { Err(()) }
+    });
+    if taken.is_ok() {
+        let _ = player.drop_stack(host, stack, false);
+    }
 }
 
 /// A click in an editable menu, as vanilla's `doClick` does it for the kinds that move items: a left or right
@@ -711,15 +802,22 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
         log(&format!("snapshot not applied for {uuid:032x}: {why}"));
         false
     };
+    let rebuilt = |host: &mut dyn ServerHost, slots: &[Option<core::StoredItem>]| {
+        let mut slots = slots.to_vec();
+        for stored in slots.iter_mut().flatten() {
+            core::apply_maps(&mut stored.item, &mut HostMaps { host: &mut *host });
+        }
+        slots
+    };
     let inventory = match &plan.inventory {
-        Some((slots, held)) => match stacks(&*host, slots) {
+        Some((slots, held)) => match { let slots = rebuilt(&mut *host, slots); stacks(&*host, &slots) } {
             Ok(stacks) => Some((stacks, *held)),
             Err(why) => return refuse(format!("inventory {why}")),
         },
         None => None,
     };
     let ender_chest = match &plan.ender_chest {
-        Some(slots) => match stacks(&*host, slots) {
+        Some(slots) => match { let slots = rebuilt(&mut *host, slots); stacks(&*host, &slots) } {
             Ok(stacks) => Some(stacks),
             Err(why) => return refuse(format!("ender chest {why}")),
         },
@@ -746,13 +844,10 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
         }
     }
     // Advancements: `player_set_advancements` loads the saved progress as vanilla loads its file (nothing is awarded: no
-    // toast, chat line or reward). Behind the `horizon_advancements` feature, see `read_player`.
-    #[cfg(feature = "horizon_advancements")]
-    {
-        if let Some(advancements) = &plan.advancements {
-            if !player.set_advancements(host, &advancements.to_string()) {
-                log(&format!("advancements not applied for {uuid:032x}"));
-            }
+    // toast, chat line or reward).
+    if let Some(advancements) = &plan.advancements {
+        if !player.set_advancements(host, &advancements.to_string()) {
+            log(&format!("advancements not applied for {uuid:032x}"));
         }
     }
     // Statistics: each saved count replaces the player's (`Player.resetStat`, then `awardStat`); a statistic the
@@ -973,6 +1068,7 @@ impl Hooks for Mod {
         if !core::running() {
             return;
         }
+        drop_cursor(host, event.player);
         // A leaving player is saved after the game stopped letting them be read: then the file the
         // save just wrote is read instead.
         let read = read_player(host, event.player).or_else(|| read_saved(event.directory, event.player));
@@ -1117,6 +1213,7 @@ impl Hooks for Mod {
         let moved = match (event.mode, drag, slot) {
             (5, Some(drag), _) => drag_carry(host, menu, &drag),
             (5, None, _) => false,
+            (4, _, _) | (0, _, None) => throw_click(host, menu, event.uuid, slot, event.button, event.mode),
             (_, _, Some(slot)) => edit_click(host, menu, event.uuid, own, slot, event.button, event.mode),
             _ => false,
         };
@@ -1398,14 +1495,10 @@ impl Hooks for Mod {
     }
 
     // `BukkitLockedEventListener.onInventoryClick`: a locked player's click in their own inventory or a container is
-    // cancelled. Needs the `container_click` hook (engine main 7cb3ef30c3, not in the pinned SDK): behind `next-engine`.
-    // Unsure (blind): the event struct is `ContainerClickEvent` with `player: u128` and `cancelled: bool`.
-    #[cfg(feature = "next-engine")]
+    // cancelled (`container_click`, window 0 and block containers).
     fn container_click(&self, _: &mut dyn ServerHost, event: &mut ContainerClickEvent<'_>) -> Flow {
         if core::is_locked(event.player) { Flow::Cancel } else { Flow::Continue }
     }
-    // HMOD-GAP(locked-inventory-click): without the `next-engine` feature no hook answers a click in the player's own
-    // inventory screen; only `container_opened` is refused.
 }
 
 #[cfg(test)]

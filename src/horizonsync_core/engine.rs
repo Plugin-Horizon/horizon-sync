@@ -9,6 +9,7 @@ use crate::horizonsync_core::config::Config;
 use crate::horizonsync_core::data::{self, EnderChest, Inventory, StoredItem};
 use crate::horizonsync_core::snapshot::keys;
 use crate::horizonsync_core::db::{usable, Db, Stored};
+use crate::horizonsync_core::maps;
 use crate::horizonsync_core::nbt::Nbt;
 use crate::horizonsync_core::player::{self, ApplyPlan};
 use crate::horizonsync_core::redis_mgr::{Message, MessageType, Redis};
@@ -35,6 +36,19 @@ pub trait Store: Send + Sync {
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;
+    /// The map tables (`getMapData`, `saveMapData`, `getBoundMapId`, `setMapBinding`); a store without them has no maps.
+    fn map_file(&self, _server: &str, _id: i32) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn save_map_file(&self, _server: &str, _id: i32, _file: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    fn bound_map_id(&self, _from_server: &str, _from_id: i32, _to_server: &str) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
+    fn set_map_binding(&self, _from_server: &str, _from_id: i32, _to_server: &str, _to_id: i32) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The Redis calls (`RedisManager`); [`Redis`] on a real server.
@@ -75,6 +89,10 @@ forward!(Db => Store {
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;
+    fn map_file(&self, server: &str, id: i32) -> Result<Option<Vec<u8>>, String>;
+    fn save_map_file(&self, server: &str, id: i32, file: &[u8]) -> Result<(), String>;
+    fn bound_map_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Result<Option<i32>, String>;
+    fn set_map_binding(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) -> Result<(), String>;
 });
 
 forward!(Redis => Cache {
@@ -196,6 +214,37 @@ pub struct Engine {
     tokens: AtomicU64,
     disabling: AtomicBool,
     saves: (Mutex<usize>, Condvar),
+}
+
+/// The map tables as the map walk reads them; a failed call is logged and reads as nothing.
+struct EngineMaps<'a> {
+    engine: &'a Engine,
+}
+
+impl maps::MapStore for EngineMaps<'_> {
+    fn read(&self, server: &str, id: i32) -> Option<maps::MapPixels> {
+        match self.engine.db.map_file(server, id) {
+            Ok(file) => file.and_then(|f| maps::decode(&f)),
+            Err(e) => {
+                log::warn!("[HuskSync] could not read map data: {e}");
+                None
+            }
+        }
+    }
+    fn write(&self, server: &str, id: i32, pixels: &maps::MapPixels) {
+        let version = util::data_version_of(&self.engine.platform.minecraft_version);
+        if let Err(e) = self.engine.db.save_map_file(server, id, &maps::encode(pixels, version)) {
+            log::warn!("[HuskSync] could not write map data: {e}");
+        }
+    }
+    fn bound_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Option<i32> {
+        self.engine.db.bound_map_id(from_server, from_id, to_server).ok().flatten()
+    }
+    fn bind(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) {
+        if let Err(e) = self.engine.db.set_map_binding(from_server, from_id, to_server, to_id) {
+            log::warn!("[HuskSync] could not bind map ids: {e}");
+        }
+    }
 }
 
 /// Who runs a command.
@@ -338,6 +387,25 @@ impl Engine {
     }
 
     // ----- what the game calls -----
+
+    /// `synchronization.persist_locked_maps`.
+    pub fn persist_locked_maps(&self) -> bool {
+        self.cfg().synchronization.persist_locked_maps
+    }
+
+    /// Saves the locked maps of a stack (and of what it holds) before it goes into a snapshot.
+    pub fn persist_maps(&self, item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+        if self.persist_locked_maps() {
+            maps::persist(item, &self.platform.server_name, &EngineMaps { engine: self }, world);
+        }
+    }
+
+    /// Rebuilds the persisted locked maps of a stack on this server.
+    pub fn apply_maps(&self, item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+        if self.persist_locked_maps() {
+            maps::apply(item, &self.platform.server_name, &EngineMaps { engine: self }, world);
+        }
+    }
 
     pub fn is_locked(&self, player: u128) -> bool {
         self.disabling.load(Ordering::Relaxed) || self.st().locked.contains(&player)

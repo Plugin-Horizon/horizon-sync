@@ -19,11 +19,9 @@ log = "0.4"
 snap = "1"
 indexmap = { version = "2", features = ["serde"] }
 getrandom = "0.3"
-
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
 
 [features]
-# APIs that exist on Horizon engine main (7cb3ef30c3) but not in the pinned SDK: container_click, player_advancements.
-next-engine = ["horizon_advancements"]
-# Per-player advancement sync through `player_advancements` / `player_set_advancements`, which an open upstream pull
-# request adds (gap-advancements); not in the pinned SDK yet, so off by default.
-horizon_advancements = []
+default = ["net"]
+# The mc-logs upload of `/husksync dump confirm`.
+net = ["dep:ureq"]
