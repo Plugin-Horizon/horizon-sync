@@ -93,11 +93,13 @@ mod tests {
     fn listeners_fire_and_cancel() {
         let p: Packed = serde_json::from_str("{}").unwrap();
         assert!(!fire_pre_sync(1, &p, "SYNCHRONIZED"));
+        // The registry is process-wide: listeners here only touch their own player ids.
         on_pre_sync(|e| e.cancelled = e.player == 7);
         assert!(fire_pre_sync(7, &p, "NEW_USER"));
         assert!(!fire_pre_sync(8, &p, "NEW_USER"));
-        on_data_save(|e| e.cancelled = e.save_cause == "DEATH");
+        on_data_save(|e| e.cancelled = e.player == 0xDEAD_BEEF);
         assert!(!fire_data_save(1, &p));
+        assert!(fire_data_save(0xDEAD_BEEF, &p));
         on_sync_complete(|_| {});
         fire_sync_complete(1, "UPDATED");
     }
