@@ -4,6 +4,7 @@
 //!
 //! Derived from HuskSync by William278 (Apache License 2.0); see NOTICE.
 
+pub mod api;
 pub mod commands;
 pub mod config;
 pub mod data;
@@ -12,6 +13,7 @@ pub mod engine;
 pub mod maps;
 pub mod messages;
 pub mod nbt;
+pub mod pg_sql;
 pub mod player;
 pub mod records;
 pub mod redis_mgr;

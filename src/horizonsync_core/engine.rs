@@ -132,6 +132,15 @@ pub enum UpdateCause {
 }
 
 impl UpdateCause {
+    /// The `DataSnapshot.UpdateCause` constant's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            UpdateCause::Synchronized => "SYNCHRONIZED",
+            UpdateCause::NewUser => "NEW_USER",
+            UpdateCause::Updated => "UPDATED",
+        }
+    }
+
     /// The `messages-<language>.yml` key of the success notice (`UpdateCause`'s texts in HuskSync).
     fn completed(self) -> &'static str {
         match self {
@@ -571,6 +580,10 @@ impl Engine {
                 return;
             }
         };
+        if crate::horizonsync_core::api::fire_pre_sync(player, &s, cause.name()) {
+            self.complete_sync(player, false, cause);
+            return;
+        }
         let plan = player::plan(&s.data, &s.minecraft_version, &self.cfg());
         for (key, e) in &plan.skipped {
             log::warn!(
@@ -601,6 +614,7 @@ impl Engine {
         let slot = self.cfg().synchronization.notification_display_slot.to_ascii_uppercase();
         if ok {
             self.unlock(player);
+            crate::horizonsync_core::api::fire_sync_complete(player, cause.name());
             match slot.as_str() {
                 "CHAT" => self.notice(player, cause.completed(), false),
                 "ACTION_BAR" | "TOAST" => self.notice(player, cause.completed(), true),
@@ -691,6 +705,9 @@ impl Engine {
 
     /// `DataSyncer.persistSnapshot`: during shutdown a DISCONNECT write is verified and retried.
     fn persist(&self, player: u128, s: &Packed) {
+        if crate::horizonsync_core::api::fire_data_save(player, s) {
+            return;
+        }
         let verify = self.disabling.load(Ordering::Relaxed) && s.save_cause == "DISCONNECT";
         if !verify {
             if let Err(e) = self.db.add_snapshot(player, s) {

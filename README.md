@@ -95,7 +95,7 @@ from; keep `bukkit` to share with Paper), `database.timestamp_zone` (the zone of
 column, `local` as a Paper JVM on the same machine) and `[worlds]` (the Bukkit world name and UUID per
 dimension, for `location`).
 
-Not supported: `database.type` `POSTGRES`/`MONGO` (no driver in the build), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
+Not supported: `database.type` `POSTGRES`/`MONGO` (Postgres statements exist in pg_sql.rs; the client crates are not in the workspace yet), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
 
 ## Build
 
