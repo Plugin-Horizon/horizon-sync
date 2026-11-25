@@ -59,6 +59,13 @@ impl Store for Arc<FakeDb> {
     fn add_snapshot_without_rotation(&self, player: u128, s: &Packed) -> Result<(), String> {
         self.add_snapshot(player, s)
     }
+    fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String> {
+        let mut rows = self.rows.lock().unwrap();
+        if let Some(row) = rows.entry(player).or_default().iter_mut().find(|p| p.id == s.id) {
+            *row = s.clone();
+        }
+        Ok(())
+    }
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String> {
         let mut rows = self.rows.lock().unwrap();
         let v = rows.entry(player).or_default();
@@ -398,4 +405,56 @@ fn a_death_with_nothing_to_save_follows_save_empty_items() {
     e.on_death(P, &parse_snbt("{Health:0.0f}").unwrap(), Vec::new());
     std::thread::sleep(Duration::from_millis(200));
     assert!(db.sorted(P).is_empty());
+}
+
+#[test]
+fn service_snapshot_api_round_trips_through_the_store() {
+    use crate::horizonsync_core::api::handle;
+    let (e, db, _) = setup("LOCKSTEP");
+    let player = 0x11u128;
+    let id = util::uuid_string(player);
+    assert_eq!(handle(&e, "version").as_deref(), Some("4.1.0"));
+    assert_eq!(handle(&e, &format!("get_latest_snapshot\t{id}")).as_deref(), Some("none"));
+    let built = handle(&e, "snapshot_builder\tAPI\tfalse\t{\"husksync:health\":\"{}\"}").unwrap();
+    // set_current_data stores a new version with the cause API.
+    let set = handle(&e, &format!("set_current_data\t{id}\t{built}")).unwrap();
+    let stored: Packed = serde_json::from_str(&set).unwrap();
+    assert_eq!(stored.save_cause, "API");
+    assert_eq!(db.sorted(player).len(), 1);
+    assert_ne!(stored.id, serde_json::from_str::<Packed>(&built).unwrap().id);
+    // edit_snapshot changes one entry in place; an empty value removes it.
+    let edited = handle(&e, &format!("edit_snapshot\t{id}\t{}\tmymod:x\t42", stored.id)).unwrap();
+    assert_eq!(serde_json::from_str::<Packed>(&edited).unwrap().data["mymod:x"], "42");
+    assert_eq!(db.sorted(player)[0].data["mymod:x"], "42");
+    handle(&e, &format!("remove_snapshot_data\t{id}\t{}\tmymod:x", stored.id)).unwrap();
+    assert!(!db.sorted(player)[0].data.contains_key("mymod:x"));
+    // edit_latest_snapshot edits the newest in place; edit_current_data saves a new version.
+    handle(&e, &format!("edit_latest_snapshot\t{id}\tmymod:y\t1")).unwrap();
+    assert_eq!(db.sorted(player).len(), 1);
+    handle(&e, &format!("edit_current_data\t{id}\tmymod:z\t2")).unwrap();
+    assert_eq!(db.sorted(player).len(), 2);
+    let all = handle(&e, &format!("get_snapshots\t{id}")).unwrap();
+    assert_eq!(serde_json::from_str::<Vec<Packed>>(&all).unwrap().len(), 2);
+    let size = handle(&e, &format!("get_snapshot_file_size\t{id}\t{}", stored.id)).unwrap();
+    assert!(size.parse::<usize>().unwrap() > 0);
+    assert_eq!(handle(&e, &format!("get_snapshot\t{id}\t{}", util::uuid_string(9))).as_deref(), Some("none"));
+}
+
+#[test]
+fn service_serializers_packing_and_syncer() {
+    use crate::horizonsync_core::api::handle;
+    let (e, _, _) = setup("LOCKSTEP");
+    assert_eq!(handle(&e, "register_data_serializer\tmymod:thing").as_deref(), Some("true"));
+    assert_eq!(handle(&e, "register_data_serializer\tmymod:thing").as_deref(), Some("false"));
+    assert_eq!(handle(&e, "register_data_serializer\thusksync:inventory").as_deref(), Some("false"));
+    assert_eq!(handle(&e, "get_data_serializer\tmymod:thing").as_deref(), Some("true"));
+    assert_eq!(handle(&e, "get_data_serializer\tmymod:other").as_deref(), Some("false"));
+    assert_eq!(handle(&e, "serialize_data\tmymod:thing\tabc").as_deref(), Some("abc"));
+    let built = handle(&e, "snapshot_builder\tAPI\tfalse\t{\"mymod:thing\":\"x\"}").unwrap();
+    let hex = handle(&e, &format!("pack_snapshot\t{built}")).unwrap();
+    assert_eq!(handle(&e, &format!("unpack_snapshot\t{hex}")).unwrap(), built);
+    assert_eq!(handle(&e, "set_data_syncer\tDELAY").as_deref(), Some("true"));
+    assert!(!e.cfg().synchronization.lockstep());
+    assert_eq!(handle(&e, "set_data_syncer\tNOPE").as_deref(), Some("false"));
+    assert_eq!(handle(&e, "no_such_op"), None);
 }

@@ -2,7 +2,7 @@
 
 ## Port status
 
-Round 2 (2026-11-25): 21/24 items done, see audit/rec100/husksync.md. Locked inventory click cancel, advancement sync, locked-map persistence, menu throws and the mc-logs dump upload are normal code now.
+Round 6 (2026-11-25): 25/27 done, see audit/rec100/husksync.md; HuskSyncAPI is the mod service `husksync:api` (ops listed in api.rs), the 2 open items are engine-side (Postgres/Mongo drivers, advancement cancel).
 
 Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
 
@@ -113,7 +113,7 @@ Remaining gaps:
 
 - The advancement announcement of a locked player is not suppressed (`player_advancement_done_cancel` is in engine PR branch area-followups-2 only).
 - PostgreSQL and MongoDB are not supported (no driver; MariaDB/MySQL is what the rec servers use).
-- The Bukkit event API (PreSync, DataSave, SyncComplete) for other plugins does not exist (no Horizon cross-mod event bus).
+- The events reach other mods as service callbacks (`<id>:husksync_event`, after the fact, not cancellable); in-process listeners can cancel.
 - Locked maps are saved in the map tables only; the Redis map caches are not written (they are a cache).
 
 ## Licence

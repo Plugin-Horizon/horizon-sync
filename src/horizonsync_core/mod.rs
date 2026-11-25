@@ -222,6 +222,11 @@ pub fn permission_for(line: &str) -> Option<(String, u8)> {
     commands::permission_for(line)
 }
 
+/// One call of the service `husksync:api`.
+pub fn service(payload: &str) -> Option<String> {
+    api::handle(engine()?, payload)
+}
+
 /// A command line (without its slash); true when it is ours.
 pub fn perform_command(sender: Sender, line: &str) -> bool {
     match engine() {

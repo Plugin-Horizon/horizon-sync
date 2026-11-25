@@ -33,6 +33,7 @@ pub trait Store: Send + Sync {
     fn snapshot(&self, player: u128, version: u128) -> Result<Option<Stored>, String>;
     fn add_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn add_snapshot_without_rotation(&self, player: u128, s: &Packed) -> Result<(), String>;
+    fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;
@@ -86,6 +87,7 @@ forward!(Db => Store {
     fn snapshot(&self, player: u128, version: u128) -> Result<Option<Stored>, String>;
     fn add_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn add_snapshot_without_rotation(&self, player: u128, s: &Packed) -> Result<(), String>;
+    fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;

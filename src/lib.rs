@@ -22,7 +22,7 @@ use mod_api::{TriState,
     LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
     PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
-    PlayerSaveToFileEvent,
+    ModServiceCallEvent, ModServiceError, PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
     StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
@@ -1113,6 +1113,15 @@ impl Hooks for Mod {
         core::on_join(event.player, &event.name);
     }
 
+    /// The service `husksync:api` (`horizonsync_core::api`).
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "husksync:api" {
+            return None;
+        }
+        let text = std::str::from_utf8(&event.payload.0).ok()?;
+        core::service(text).map(|reply| mod_api::PayloadBytes(reply.into_bytes()))
+    }
+
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if !matches!(event.phase, ServerTickPhase::ServerTickStart { world_running: true, .. }) {
             return;
@@ -1121,6 +1130,17 @@ impl Hooks for Mod {
             return;
         }
         self.saved_now.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Events for the mods that subscribed to `husksync:api`; one that is gone is dropped.
+        let (subscribers, lines) = core::api::take_events();
+        for id in subscribers {
+            let service = format!("{id}:husksync_event");
+            for line in &lines {
+                if let Err(ModServiceError::ProviderNotLoaded) = host.commands().call_mod_service(&service, line.as_bytes()) {
+                    core::api::unsubscribe(&id);
+                    break;
+                }
+            }
+        }
         let players = players_online(&*host);
         let deferred = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
         for mut d in deferred {
