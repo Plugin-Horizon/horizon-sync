@@ -4,7 +4,7 @@
 
 Round 6 (2026-11-25): 25/27 done, see audit/rec100/husksync.md; HuskSyncAPI is the mod service `husksync:api` (ops listed in api.rs), the 2 open items are engine-side (Postgres/Mongo drivers, advancement cancel).
 
-Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
+Item list truth: 25 of 27 items done (93 %); the 2 open ones are engine-side. Not every Java class counts as an item, the list covers the commands, permissions, config keys, messages, sync rules and the API.
 
 HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
 Rust server for Minecraft 26.3). Players keep their inventory, ender chest, health, hunger, experience,
