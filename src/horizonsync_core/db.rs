@@ -28,12 +28,12 @@ pub struct Db {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Zone {
+pub(crate) enum Zone {
     Local,
     Fixed(i32),
 }
 
-fn parse_zone(s: &str) -> Zone {
+pub(crate) fn parse_zone(s: &str) -> Zone {
     if s.eq_ignore_ascii_case("local") || s.is_empty() {
         return Zone::Local;
     }
@@ -50,16 +50,35 @@ fn parse_zone(s: &str) -> Zone {
 
 impl Zone {
     /// `Timestamp.from(instant)` as JDBC writes it into a DATETIME: the wall time in the zone.
-    fn to_value(self, t: &chrono::DateTime<chrono::FixedOffset>) -> Value {
-        let wall = match self {
+    pub(crate) fn wall(self, t: &chrono::DateTime<chrono::FixedOffset>) -> chrono::NaiveDateTime {
+        match self {
             Zone::Local => t.with_timezone(&chrono::Local).naive_local(),
             Zone::Fixed(secs) => t
                 .with_timezone(&chrono::FixedOffset::east_opt(secs).unwrap_or(*t.offset()))
                 .naive_local(),
-        };
-        // `mysql`'s `chrono` feature binds a wall time as a DATETIME.
-        Value::from(wall)
+        }
     }
+
+    fn to_value(self, t: &chrono::DateTime<chrono::FixedOffset>) -> Value {
+        // `mysql`'s `chrono` feature binds a wall time as a DATETIME.
+        Value::from(self.wall(t))
+    }
+}
+
+/// A snapshot row as read back from any store: the id the database knows it by and the document bytes.
+pub(crate) fn stored_from(version_uuid: String, data: Option<Vec<u8>>, compress: bool) -> Stored {
+    let snapshot = match data {
+        Some(bytes) => Packed::from_bytes(&bytes, compress).map(|mut p| {
+            // The row's id is the one the database knows it by (`deserialize(..., id, ...)`
+            // leaves the JSON's; they are the same unless edited by hand).
+            if p.id.is_empty() {
+                p.id = version_uuid.clone();
+            }
+            p
+        }),
+        None => Err("no data".into()),
+    };
+    Stored { version_uuid, snapshot }
 }
 
 /// The schema, as `mariadb_schema.sql` (MySQL gets the same statements).
@@ -256,19 +275,7 @@ impl Db {
 
     fn stored(&self, row: Row) -> Stored {
         let version_uuid: String = row.get("version_uuid").unwrap_or_default();
-        let data: Option<Vec<u8>> = row.get("data");
-        let snapshot = match data {
-            Some(bytes) => Packed::from_bytes(&bytes, self.compress).map(|mut p| {
-                // The row's id is the one the database knows it by (`deserialize(..., id, ...)`
-                // leaves the JSON's; they are the same unless edited by hand).
-                if p.id.is_empty() {
-                    p.id = version_uuid.clone();
-                }
-                p
-            }),
-            None => Err("no data".into()),
-        };
-        Stored { version_uuid, snapshot }
+        stored_from(version_uuid, row.get("data"), self.compress)
     }
 
     pub fn latest_snapshot(&self, player: u128) -> Result<Option<Stored>, String> {

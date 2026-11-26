@@ -2,9 +2,9 @@
 
 ## Port status
 
-Round 6 (2026-11-25): 25/27 done, see audit/rec100/husksync.md; HuskSyncAPI is the mod service `husksync:api` (ops listed in api.rs), the 2 open items are engine-side (Postgres/Mongo drivers, advancement cancel).
+Round 8 (2026-11-26): 27/27 done, see audit/rec100/husksync.md; HuskSyncAPI is the mod service `husksync:api` (ops listed in api.rs). Postgres and Mongo stores and the locked-player advancement cancel are written; the build is queued and not yet confirmed by a test run.
 
-Item list truth: 25 of 27 items done (93 %); the 2 open ones are engine-side. Not every Java class counts as an item, the list covers the commands, permissions, config keys, messages, sync rules and the API.
+Item list truth: 27 of 27 items done (100 %). Not every Java class counts as an item, the list covers the commands, permissions, config keys, messages, sync rules and the API.
 
 HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
 Rust server for Minecraft 26.3). Players keep their inventory, ender chest, health, hunger, experience,
@@ -95,7 +95,7 @@ from; keep `bukkit` to share with Paper), `database.timestamp_zone` (the zone of
 column, `local` as a Paper JVM on the same machine) and `[worlds]` (the Bukkit world name and UUID per
 dimension, for `location`).
 
-Not supported: `database.type` `POSTGRES`/`MONGO` (Postgres statements exist in pg_sql.rs; the client crates are not in the workspace yet), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
+Not supported: map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
 
 ## Build
 
@@ -111,8 +111,8 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 Remaining gaps:
 
-- The advancement announcement of a locked player is not suppressed (`player_advancement_done_cancel` is in engine PR branch area-followups-2 only).
-- PostgreSQL and MongoDB are not supported (no driver; MariaDB/MySQL is what the rec servers use).
+- The advancement announcement of a locked player is suppressed through `player_advancement_done_cancel`.
+- `database.type` `POSTGRES` (`pg_store.rs`, no TLS) and `MONGO` (`mongo_store.rs`, collections named like the tables, uuids as text) are supported; neither has run against a live database, and the Mongo field layout is not verified against data written by Paper.
 - The events reach other mods as service callbacks (`<id>:husksync_event`, after the fact, not cancellable); in-process listeners can cancel.
 - Locked maps are saved in the map tables only; the Redis map caches are not written (they are a cache).
 

@@ -21,7 +21,7 @@ use mod_api::{TriState,
     GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LevelRandomHost,
     LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
-    PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
+    PermissionNode, PermissionValueType, PlayerAdvancementDoneCancelEvent, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
     ModServiceCallEvent, ModServiceError, PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
@@ -1519,11 +1519,28 @@ impl Hooks for Mod {
     fn container_click(&self, _: &mut dyn ServerHost, event: &mut ContainerClickEvent<'_>) -> Flow {
         if core::is_locked(event.player) { Flow::Cancel } else { Flow::Continue }
     }
+
+    // `BukkitLockedEventListener.onPlayerAdvancement`: a locked player's completed advancement gets no toast,
+    // announcement or reward (the progress itself stays; the sync writes it back with the rest of the data).
+    fn player_advancement_done_cancel(&self, _: &mut dyn ServerHost, event: &mut PlayerAdvancementDoneCancelEvent<'_>) -> Flow {
+        locked_flow(core::is_locked(event.player))
+    }
+}
+
+/// The flow of a hook that only a locked player's action is cancelled in.
+fn locked_flow(locked: bool) -> Flow {
+    if locked { Flow::Cancel } else { Flow::Continue }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_locked_players_advancement_is_cancelled() {
+        assert!(matches!(locked_flow(true), Flow::Cancel));
+        assert!(matches!(locked_flow(false), Flow::Continue));
+    }
 
     #[test]
     fn statistics_become_the_vanilla_document_and_back() {

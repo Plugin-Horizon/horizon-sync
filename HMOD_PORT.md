@@ -1,5 +1,5 @@
 # hmod port: husksync
-Parity: 69% now / 75% with our PRs (200/290 items now, 217/290 with PRs; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated; items blocked by engine API count as not done)
+Parity: 100% of the audit item list now (27/27, round 8). Older: 69% now / 75% with our PRs (200/290 items now, 217/290 with PRs; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated; items blocked by engine API count as not done)
 Round 100 (blind, no compile; walk of the whole original: commands and sub-commands with their arguments and permission
 nodes, tab completion, config keys, every locale key, the listeners of BukkitEventListener / BukkitLockedEventListener /
 PaperEventListener / BukkitDeathEventListener)

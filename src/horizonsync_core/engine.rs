@@ -275,9 +275,13 @@ pub struct Sender {
 
 impl Engine {
     pub fn new(config: Config, dir: std::path::PathBuf) -> Result<Arc<Engine>, String> {
-        let db = Db::connect(&config)?;
+        let db: Box<dyn Store> = match config.database.kind.to_ascii_uppercase().as_str() {
+            "POSTGRES" | "POSTGRESQL" => Box::new(crate::horizonsync_core::pg_store::PgDb::connect(&config)?),
+            "MONGO" | "MONGODB" => Box::new(crate::horizonsync_core::mongo_store::MongoDb::connect(&config)?),
+            _ => Box::new(Db::connect(&config)?),
+        };
         let redis = Redis::connect(&config, &config.server_name)?;
-        Self::with(config, dir, Box::new(db), Box::new(redis))
+        Self::with(config, dir, db, Box::new(redis))
     }
 
     /// An engine over any store and cache (the tests use in-memory ones).
