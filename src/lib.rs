@@ -1270,7 +1270,7 @@ impl Hooks for Mod {
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // The public usages (`horizonsync`, `horizonsync about`) and the console-only ones (level 4) are open.
         // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): see
-        // register_node_commands. `player_command` answers the typed line with HuskSync's own denial.
+        // register_node_commands. a player without the node gets vanilla's unknown command, as on Paper.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
             // A name completes from the players online (`cmdkit`); the core reads the name from the text anyway.
@@ -1353,36 +1353,9 @@ impl Hooks for Mod {
         if core::refuse_command(event.player, event.command) {
             return Flow::Cancel;
         }
-        // An operator usage the player lacks the node for is hidden from their tree: answer HuskSync's denial
-        // here (also while the mod is off), not the engine's "unknown command". The console is never asked.
-        let line = event.command.trim_start_matches('/').to_owned();
-        let root = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        let sub = line.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
-        if !labels().iter().any(|l| *l == root) || matches!(sub.as_str(), "forceupgrade" | "migrate") {
-            return Flow::Continue;
-        }
-        let Some((node, required)) = core::permission_for(&line) else {
-            return Flow::Continue;
-        };
-        if required == 0 {
-            return Flow::Continue;
-        }
-        let allowed = match host.player(event.player) {
-            Some(p) => p.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false),
-            None => false,
-        };
-        if allowed {
-            return Flow::Continue;
-        }
-        event.cancelled = true;
-        for line in core::locale_lines("error_no_permission", &[]) {
-            let text = match host.text_from_json(&line.component.to_string()) {
-                Ok(Some(text)) => text,
-                _ => Text::literal(line.plain),
-            };
-            event.replies.push(text);
-        }
-        Flow::Cancel
+        // An operator usage the player lacks the node for is not in their tree: the engine answers vanilla's
+        // unknown command, as Paper does for a Bukkit command whose permission the sender lacks.
+        Flow::Continue
     }
 
     // Save on death (HuskSync's `saveOnPlayerDeath`) with `items_to_save: DROPS`: the stacks the player
