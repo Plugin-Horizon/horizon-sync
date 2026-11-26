@@ -1,8 +1,9 @@
-//! `MongoDbDatabase`: HuskSync's MongoDB storage on the official driver's blocking API. The collections carry the
-//! configured table names; a document holds the columns of the SQL tables as fields (`uuid`, `username` in the users
-//! collection; `player_uuid`, `version_uuid`, `timestamp`, `save_cause`, `pinned`, `data` in the user data collection;
-//! `server_name`, `map_id`, `data` and `from_server_name`, `from_id`, `to_server_name`, `to_id` for maps). Uuids are
-//! their text form, the data is a generic binary.
+//! `MongoDbDatabase`: HuskSync's MongoDB storage on the official driver's blocking API, checked against
+//! `MongoDbDatabase.java` (Apache-2.0). The collections carry the configured table names; a document holds the columns
+//! of the SQL tables as fields (`uuid`, `username` in the users collection; `player_uuid`, `version_uuid`, `timestamp`
+//! as epoch milliseconds (int64), `save_cause`, `pinned`, `data` in the user data collection; `server_name`, `map_id`,
+//! `data` and `from_server_name`, `from_id`, `to_server_name`, `to_id` for maps). Uuids are BSON binary subtype 4
+//! (the Java client's `UuidRepresentation.STANDARD`), the data is a generic binary.
 
 use crate::horizonsync_core::config::{Config, Database as DbConfig, TableNames};
 use crate::horizonsync_core::db::{stored_from, Stored};
@@ -10,7 +11,7 @@ use crate::horizonsync_core::engine::Store;
 use crate::horizonsync_core::snapshot::Packed;
 use crate::horizonsync_core::util;
 use mongodb::bson::spec::BinarySubtype;
-use mongodb::bson::{doc, Binary, Bson, DateTime, Document};
+use mongodb::bson::{doc, Binary, Bson, Document};
 use mongodb::sync::{Client, Collection, Database};
 use std::time::Duration;
 
@@ -33,20 +34,38 @@ fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-/// The connection string of a `database` section: `mongodb://user:pass@host:port/?authSource=admin`.
+/// The connection string of a `database` section, as `createConnectionURI` builds it
+/// (`mongodb://user:pass@host:port/database` plus `mongo_settings.parameters`, whose default is
+/// `?retryWrites=true&w=majority&authSource=HuskSync`; the auth source here is the database).
 pub fn uri(c: &DbConfig) -> String {
     let auth = if c.username.is_empty() { String::new() } else { format!("{}:{}@", enc(&c.username), enc(&c.password)) };
-    let mut q = Vec::new();
+    let mut q = vec!["retryWrites=true".to_owned(), "w=majority".to_owned()];
     if !c.username.is_empty() {
-        q.push("authSource=admin");
+        q.push(format!("authSource={}", c.database));
     }
     if c.use_ssl {
-        q.push("tls=true");
+        q.push("tls=true".into());
     }
-    q.push("serverSelectionTimeoutMS=");
-    let timeout = c.connection_timeout.max(1000).to_string();
-    let query = q.iter().map(|p| if p.ends_with('=') { format!("{p}{timeout}") } else { (*p).to_owned() }).collect::<Vec<_>>().join("&");
-    format!("mongodb://{auth}{}:{}/?{query}", c.host, c.port)
+    q.push(format!("serverSelectionTimeoutMS={}", c.connection_timeout.max(1000)));
+    format!("mongodb://{auth}{}:{}/{}?{}", c.host, c.port, c.database, q.join("&"))
+}
+
+/// A uuid as the Java client stores it with `UuidRepresentation.STANDARD`: binary subtype 4, big-endian bytes.
+pub fn uuid_bson(u: u128) -> Bson {
+    Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes: u.to_be_bytes().to_vec() })
+}
+
+/// A stored uuid: standard binary, or its text form.
+pub fn uuid_of(b: &Bson) -> Option<u128> {
+    match b {
+        Bson::Binary(x) if x.bytes.len() == 16 => Some(u128::from_be_bytes(x.bytes.clone().try_into().ok()?)),
+        Bson::String(s) => util::parse_uuid(s),
+        _ => None,
+    }
+}
+
+fn text_uuid(s: &str) -> Bson {
+    util::parse_uuid(s).map(uuid_bson).unwrap_or_else(|| Bson::String(s.to_owned()))
 }
 
 fn binary(bytes: Vec<u8>) -> Bson {
@@ -69,15 +88,16 @@ fn int_of(d: &Document, key: &str) -> Option<i32> {
 }
 
 fn doc_stored(d: &Document, compress: bool) -> Stored {
-    stored_from(d.get_str("version_uuid").unwrap_or_default().to_owned(), bytes_of(d, "data"), compress)
+    let version = d.get("version_uuid").and_then(uuid_of).map(util::uuid_string).unwrap_or_default();
+    stored_from(version, bytes_of(d, "data"), compress)
 }
 
 /// The document of a snapshot row.
 pub fn snapshot_doc(player: u128, s: &Packed, time: &chrono::DateTime<chrono::FixedOffset>, compress: bool) -> Document {
     doc! {
-        "player_uuid": util::uuid_string(player),
-        "version_uuid": &s.id,
-        "timestamp": DateTime::from_millis(time.timestamp_millis()),
+        "player_uuid": uuid_bson(player),
+        "version_uuid": text_uuid(&s.id),
+        "timestamp": time.timestamp_millis(),
         "save_cause": &s.save_cause,
         "pinned": s.pinned,
         "data": binary(s.to_bytes(compress)),
@@ -97,13 +117,9 @@ impl MongoDb {
             max_snapshots: config.synchronization.max_user_data_snapshots,
             backup_frequency_hours: config.synchronization.snapshot_backup_frequency,
         };
-        // Reaches the server now, so a wrong host fails at start and not at the first join.
+        // Reaches the server now, so a wrong host fails at start and not at the first join. The original creates the
+        // four collections when `create_tables` is on; MongoDB makes them on the first write, so nothing is needed.
         m.ping()?;
-        if c.create_tables {
-            let _ = m.users().create_index(mongodb::IndexModel::builder().keys(doc! {"uuid": 1}).options(mongodb::options::IndexOptions::builder().unique(true).build()).build()).run();
-            let _ = m.data().create_index(mongodb::IndexModel::builder().keys(doc! {"player_uuid": 1, "timestamp": -1}).build()).run();
-            let _ = m.data().create_index(mongodb::IndexModel::builder().keys(doc! {"version_uuid": 1}).build()).run();
-        }
         Ok(m)
     }
 
@@ -133,7 +149,7 @@ impl MongoDb {
 
     /// `rotateSnapshots`: the oldest unpinned snapshots beyond the limit go.
     fn rotate_snapshots(&self, player: u128) -> Result<(), String> {
-        let filter = doc! {"player_uuid": util::uuid_string(player), "pinned": false};
+        let filter = doc! {"player_uuid": uuid_bson(player), "pinned": false};
         let n = self.data().count_documents(filter.clone()).run().map_err(err)? as i64;
         if n > self.max_snapshots {
             let oldest = self
@@ -157,7 +173,7 @@ impl MongoDb {
 impl Store for MongoDb {
     fn ensure_user(&self, uuid: u128, name: &str) -> Result<(), String> {
         self.users()
-            .update_one(doc! {"uuid": util::uuid_string(uuid)}, doc! {"$set": {"username": name}})
+            .update_one(doc! {"uuid": uuid_bson(uuid)}, doc! {"$set": {"username": name}})
             .upsert(true)
             .run()
             .map(|_| ())
@@ -165,19 +181,17 @@ impl Store for MongoDb {
     }
 
     fn user_by_name(&self, name: &str) -> Result<Option<(u128, String)>, String> {
-        // `LOWER(username)=LOWER(?)` of the SQL storages, as a case-insensitive exact match.
-        let pattern = format!("^{}$", name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c.to_string() } else { format!("\\{c}") }).collect::<String>());
-        let d = self.users().find_one(doc! {"username": {"$regex": pattern, "$options": "i"}}).run().map_err(err)?;
-        Ok(d.and_then(|d| Some((util::parse_uuid(d.get_str("uuid").ok()?)?, d.get_str("username").ok()?.to_owned()))))
+        let d = self.users().find_one(doc! {"username": name}).run().map_err(err)?;
+        Ok(d.and_then(|d| Some((uuid_of(d.get("uuid")?)?, d.get_str("username").ok()?.to_owned()))))
     }
 
     fn user_by_uuid(&self, uuid: u128) -> Result<Option<String>, String> {
-        let d = self.users().find_one(doc! {"uuid": util::uuid_string(uuid)}).run().map_err(err)?;
+        let d = self.users().find_one(doc! {"uuid": uuid_bson(uuid)}).run().map_err(err)?;
         Ok(d.and_then(|d| d.get_str("username").ok().map(str::to_owned)))
     }
 
     fn latest_snapshot(&self, player: u128) -> Result<Option<Stored>, String> {
-        Ok(self.snapshots(doc! {"player_uuid": util::uuid_string(player)}, Some(1))?.into_iter().next())
+        Ok(self.snapshots(doc! {"player_uuid": uuid_bson(player)}, Some(1))?.into_iter().next())
     }
 
     fn latest_snapshot_with_causes(&self, player: u128, causes: &[&str]) -> Result<Option<Stored>, String> {
@@ -185,15 +199,15 @@ impl Store for MongoDb {
             return Ok(None);
         }
         let list: Vec<&str> = causes.to_vec();
-        Ok(self.snapshots(doc! {"player_uuid": util::uuid_string(player), "save_cause": {"$in": list}}, Some(1))?.into_iter().next())
+        Ok(self.snapshots(doc! {"player_uuid": uuid_bson(player), "save_cause": {"$in": list}}, Some(1))?.into_iter().next())
     }
 
     fn all_snapshots(&self, player: u128) -> Result<Vec<Stored>, String> {
-        self.snapshots(doc! {"player_uuid": util::uuid_string(player)}, None)
+        self.snapshots(doc! {"player_uuid": uuid_bson(player)}, None)
     }
 
     fn snapshot(&self, player: u128, version: u128) -> Result<Option<Stored>, String> {
-        Ok(self.snapshots(doc! {"player_uuid": util::uuid_string(player), "version_uuid": util::uuid_string(version)}, Some(1))?.into_iter().next())
+        Ok(self.snapshots(doc! {"player_uuid": uuid_bson(player), "version_uuid": uuid_bson(version)}, Some(1))?.into_iter().next())
     }
 
     fn add_snapshot(&self, player: u128, s: &Packed) -> Result<(), String> {
@@ -202,7 +216,7 @@ impl Store for MongoDb {
                 let cut = t - chrono::Duration::hours(self.backup_frequency_hours);
                 let newer = self
                     .data()
-                    .find(doc! {"player_uuid": util::uuid_string(player), "pinned": false, "timestamp": {"$gt": DateTime::from_millis(cut.timestamp_millis())}})
+                    .find(doc! {"player_uuid": uuid_bson(player), "pinned": false, "timestamp": {"$gt": cut.timestamp_millis()}})
                     .sort(doc! {"timestamp": 1})
                     .limit(1)
                     .run()
@@ -226,14 +240,14 @@ impl Store for MongoDb {
     fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String> {
         let set = doc! {"save_cause": &s.save_cause, "pinned": s.pinned, "data": binary(s.to_bytes(self.compress))};
         self.data()
-            .update_one(doc! {"player_uuid": util::uuid_string(player), "version_uuid": &s.id}, doc! {"$set": set})
+            .update_one(doc! {"player_uuid": uuid_bson(player), "version_uuid": text_uuid(&s.id)}, doc! {"$set": set})
             .run()
             .map(|_| ())
             .map_err(err)
     }
 
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String> {
-        let r = self.data().delete_one(doc! {"player_uuid": util::uuid_string(player), "version_uuid": util::uuid_string(version)}).run().map_err(err)?;
+        let r = self.data().delete_one(doc! {"player_uuid": uuid_bson(player), "version_uuid": uuid_bson(version)}).run().map_err(err)?;
         Ok(r.deleted_count > 0)
     }
 
@@ -316,10 +330,10 @@ mod tests {
         c.username = "us er".into();
         c.password = "p@ss:/".into();
         c.connection_timeout = 7000;
-        assert_eq!(uri(&c), "mongodb://us%20er:p%40ss%3A%2F@mongo.local:27018/?authSource=admin&serverSelectionTimeoutMS=7000");
+        assert_eq!(uri(&c), "mongodb://us%20er:p%40ss%3A%2F@mongo.local:27018/HuskSync?retryWrites=true&w=majority&authSource=HuskSync&serverSelectionTimeoutMS=7000");
         c.username.clear();
         c.use_ssl = true;
-        assert_eq!(uri(&c), "mongodb://mongo.local:27018/?tls=true&serverSelectionTimeoutMS=7000");
+        assert_eq!(uri(&c), "mongodb://mongo.local:27018/HuskSync?retryWrites=true&w=majority&tls=true&serverSelectionTimeoutMS=7000");
     }
 
     #[test]
@@ -327,9 +341,9 @@ mod tests {
         let s = packed();
         let time = s.time().unwrap();
         let d = snapshot_doc(0x1234, &s, &time, true);
-        assert_eq!(d.get_str("player_uuid").unwrap(), util::uuid_string(0x1234));
-        assert_eq!(d.get_str("version_uuid").unwrap(), s.id);
-        assert_eq!(d.get_datetime("timestamp").unwrap().timestamp_millis(), time.timestamp_millis());
+        assert_eq!(uuid_of(d.get("player_uuid").unwrap()), Some(0x1234));
+        assert!(matches!(d.get("player_uuid"), Some(Bson::Binary(b)) if b.subtype == BinarySubtype::Uuid));
+        assert_eq!(d.get_i64("timestamp").unwrap(), time.timestamp_millis());
         assert!(d.get_bool("pinned").unwrap());
         let back = doc_stored(&d, true);
         assert_eq!(back.version_uuid, s.id);
@@ -338,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_document_without_data_is_unusable() {
-        let d = doc! {"version_uuid": "x"};
+        let d = doc! {"version_uuid": uuid_bson(7)};
         assert!(doc_stored(&d, false).snapshot.is_err());
     }
 

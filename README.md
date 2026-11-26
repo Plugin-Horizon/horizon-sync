@@ -112,7 +112,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 Remaining gaps:
 
 - The advancement announcement of a locked player is suppressed through `player_advancement_done_cancel`.
-- `database.type` `POSTGRES` (`pg_store.rs`, no TLS) and `MONGO` (`mongo_store.rs`, collections named like the tables, uuids as text) are supported; neither has run against a live database, and the Mongo field layout is not verified against data written by Paper.
+- `database.type` `POSTGRES` (`pg_store.rs`, no TLS) and `MONGO` (`mongo_store.rs`, collections named like the tables, uuids as BSON binary subtype 4, timestamps as epoch milliseconds, checked against the original MongoDbDatabase.java) are supported; neither has run against a live database.
 - The events reach other mods as service callbacks (`<id>:husksync_event`, after the fact, not cancellable); in-process listeners can cancel.
 - Locked maps are saved in the map tables only; the Redis map caches are not written (they are a cache).
 
