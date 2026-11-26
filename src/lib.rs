@@ -9,6 +9,7 @@
 //! another data version, an unreadable item or attribute) is refused whole, never applied in part.
 
 pub mod horizonsync_core;
+mod cmdkit;
 #[cfg(any())]
 mod legacy_glue;
 
@@ -971,20 +972,10 @@ fn show(host: &mut dyn ServerHost, uuid: u128, line: Text, overlay: bool) {
 /// The command line as the player typed it, rebuilt from the parsed invocation: the literal path,
 /// then the arguments in parse order. arismoko has no raw-line accessor (TODO(arismoko-api:
 /// command_raw_line)); this matches what the core's parser needs for the usages it registers.
-fn command_line(host: &dyn ServerHost, command: &CommandInvocation) -> String {
-    let mut words = command.literals.clone();
-    for argument in &command.arguments {
-        let text = match &argument.value {
-            CommandArgumentValue::String(s) => s.clone(),
-            CommandArgumentValue::Integer(i) => i.to_string(),
-            CommandArgumentValue::Number(n) => n.to_string(),
-            CommandArgumentValue::Boolean(b) => b.to_string(),
-            CommandArgumentValue::Player(p) => p.name(host).unwrap_or_default(),
-            _ => continue,
-        };
-        words.push(text);
-    }
-    words.join(" ")
+fn command_line(_host: &dyn ServerHost, command: &CommandInvocation) -> String {
+    // The words and arguments in the usage's order (`userdata dump <user> <version> web` has a word after its arguments).
+    let usages: Vec<String> = core::command_usages().into_iter().map(|(usage, _)| usage).collect();
+    cmdkit::rebuild(&usages, command)
 }
 
 /// The items whose use launches a projectile: bow, crossbow, trident, the throwables, the potions and the bottle, the wind
@@ -1079,7 +1070,12 @@ impl Hooks for Mod {
         }
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn player_logged_out(&self, _: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        cmdkit::left(&event.name);
         if !core::running() {
             return;
         }
@@ -1111,6 +1107,7 @@ impl Hooks for Mod {
     fn player_logged_in(&self, _: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
         // Fields `player` and `name` follow the hook's documented arguments; not compiled yet.
         core::on_join(event.player, &event.name);
+        cmdkit::joined(&event.name);
     }
 
     /// The service `husksync:api` (`horizonsync_core::api`).
@@ -1276,7 +1273,8 @@ impl Hooks for Mod {
         // register_node_commands. `player_command` answers the typed line with HuskSync's own denial.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
-            let usage = usage.replace(":player_name>", ":word>");
+            // A name completes from the players online (`cmdkit`); the core reads the name from the text anyway.
+            let usage = cmdkit::ask_names(&usage, "husksync");
             if level == 0 || level >= 4 {
                 event.commands.push(Command::new(&usage));
                 continue;
@@ -1290,7 +1288,7 @@ impl Hooks for Mod {
 
     fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
         for (usage, level) in core::command_usages() {
-            let usage = usage.replace(":player_name>", ":word>");
+            let usage = cmdkit::ask_names(&usage, "husksync");
             if level == 0 || level >= 4 {
                 continue;
             }
@@ -1530,6 +1528,27 @@ impl Hooks for Mod {
 /// The flow of a hook that only a locked player's action is cancelled in.
 fn locked_flow(locked: bool) -> Flow {
     if locked { Flow::Cancel } else { Flow::Continue }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn the_commands_of_husksync_are_in_the_tree() {
+        let usages: Vec<String> = core::command_usages().into_iter().map(|(u, _)| u).collect();
+        let paths = cmdkit::literal_paths(&usages);
+        for want in [
+            "husksync about", "husksync status", "husksync dump", "husksync reload", "husksync update", "husksync migrate",
+            "userdata view", "userdata list", "userdata delete", "userdata save", "userdata restore", "userdata pin", "userdata dump",
+            "userdata dump web", "userdata dump file", "playerdata view", "inventory", "openinv", "enderchest", "echest", "openechest",
+        ] {
+            assert!(paths.iter().any(|p| p == want), "{want}");
+        }
+        let words = ["userdata".to_owned(), "dump".to_owned(), "web".to_owned()];
+        let values = [("username".to_owned(), "Alex".to_owned()), ("version".to_owned(), "v1".to_owned())];
+        assert_eq!(cmdkit::rebuild_words(&usages, &words, &values), "userdata dump Alex v1 web");
+    }
 }
 
 #[cfg(test)]
