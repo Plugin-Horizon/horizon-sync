@@ -134,7 +134,8 @@ impl MongoDb {
     }
 
     fn snapshots(&self, filter: Document, limit: Option<i64>) -> Result<Vec<Stored>, String> {
-        let mut find = self.data().find(filter).sort(doc! {"timestamp": -1});
+        let col = self.data();
+        let mut find = col.find(filter).sort(doc! {"timestamp": -1});
         if let Some(n) = limit {
             find = find.limit(n);
         }
