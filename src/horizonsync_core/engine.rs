@@ -9,6 +9,7 @@ use crate::horizonsync_core::config::Config;
 use crate::horizonsync_core::data::{self, EnderChest, Inventory, StoredItem};
 use crate::horizonsync_core::snapshot::keys;
 use crate::horizonsync_core::db::{usable, Db, Stored};
+use crate::horizonsync_core::maps;
 use crate::horizonsync_core::nbt::Nbt;
 use crate::horizonsync_core::player::{self, ApplyPlan};
 use crate::horizonsync_core::redis_mgr::{Message, MessageType, Redis};
@@ -32,9 +33,23 @@ pub trait Store: Send + Sync {
     fn snapshot(&self, player: u128, version: u128) -> Result<Option<Stored>, String>;
     fn add_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn add_snapshot_without_rotation(&self, player: u128, s: &Packed) -> Result<(), String>;
+    fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;
+    /// The map tables (`getMapData`, `saveMapData`, `getBoundMapId`, `setMapBinding`); a store without them has no maps.
+    fn map_file(&self, _server: &str, _id: i32) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    fn save_map_file(&self, _server: &str, _id: i32, _file: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    fn bound_map_id(&self, _from_server: &str, _from_id: i32, _to_server: &str) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
+    fn set_map_binding(&self, _from_server: &str, _from_id: i32, _to_server: &str, _to_id: i32) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The Redis calls (`RedisManager`); [`Redis`] on a real server.
@@ -72,9 +87,14 @@ forward!(Db => Store {
     fn snapshot(&self, player: u128, version: u128) -> Result<Option<Stored>, String>;
     fn add_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn add_snapshot_without_rotation(&self, player: u128, s: &Packed) -> Result<(), String>;
+    fn update_snapshot(&self, player: u128, s: &Packed) -> Result<(), String>;
     fn delete_snapshot(&self, player: u128, version: u128) -> Result<bool, String>;
     fn set_pinned(&self, player: u128, version: u128, pinned: bool) -> Result<bool, String>;
     fn ping(&self) -> Result<Duration, String>;
+    fn map_file(&self, server: &str, id: i32) -> Result<Option<Vec<u8>>, String>;
+    fn save_map_file(&self, server: &str, id: i32, file: &[u8]) -> Result<(), String>;
+    fn bound_map_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Result<Option<i32>, String>;
+    fn set_map_binding(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) -> Result<(), String>;
 });
 
 forward!(Redis => Cache {
@@ -114,6 +134,15 @@ pub enum UpdateCause {
 }
 
 impl UpdateCause {
+    /// The `DataSnapshot.UpdateCause` constant's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            UpdateCause::Synchronized => "SYNCHRONIZED",
+            UpdateCause::NewUser => "NEW_USER",
+            UpdateCause::Updated => "UPDATED",
+        }
+    }
+
     /// The `messages-<language>.yml` key of the success notice (`UpdateCause`'s texts in HuskSync).
     fn completed(self) -> &'static str {
         match self {
@@ -198,6 +227,37 @@ pub struct Engine {
     saves: (Mutex<usize>, Condvar),
 }
 
+/// The map tables as the map walk reads them; a failed call is logged and reads as nothing.
+struct EngineMaps<'a> {
+    engine: &'a Engine,
+}
+
+impl maps::MapStore for EngineMaps<'_> {
+    fn read(&self, server: &str, id: i32) -> Option<maps::MapPixels> {
+        match self.engine.db.map_file(server, id) {
+            Ok(file) => file.and_then(|f| maps::decode(&f)),
+            Err(e) => {
+                log::warn!("[HuskSync] could not read map data: {e}");
+                None
+            }
+        }
+    }
+    fn write(&self, server: &str, id: i32, pixels: &maps::MapPixels) {
+        let version = util::data_version_of(&self.engine.platform.minecraft_version);
+        if let Err(e) = self.engine.db.save_map_file(server, id, &maps::encode(pixels, version)) {
+            log::warn!("[HuskSync] could not write map data: {e}");
+        }
+    }
+    fn bound_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Option<i32> {
+        self.engine.db.bound_map_id(from_server, from_id, to_server).ok().flatten()
+    }
+    fn bind(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) {
+        if let Err(e) = self.engine.db.set_map_binding(from_server, from_id, to_server, to_id) {
+            log::warn!("[HuskSync] could not bind map ids: {e}");
+        }
+    }
+}
+
 /// Who runs a command.
 #[derive(Clone, Debug)]
 pub struct Sender {
@@ -215,9 +275,13 @@ pub struct Sender {
 
 impl Engine {
     pub fn new(config: Config, dir: std::path::PathBuf) -> Result<Arc<Engine>, String> {
-        let db = Db::connect(&config)?;
+        let db: Box<dyn Store> = match config.database.kind.to_ascii_uppercase().as_str() {
+            "POSTGRES" | "POSTGRESQL" => Box::new(crate::horizonsync_core::pg_store::PgDb::connect(&config)?),
+            "MONGO" | "MONGODB" => Box::new(crate::horizonsync_core::mongo_store::MongoDb::connect(&config)?),
+            _ => Box::new(Db::connect(&config)?),
+        };
         let redis = Redis::connect(&config, &config.server_name)?;
-        Self::with(config, dir, Box::new(db), Box::new(redis))
+        Self::with(config, dir, db, Box::new(redis))
     }
 
     /// An engine over any store and cache (the tests use in-memory ones).
@@ -338,6 +402,25 @@ impl Engine {
     }
 
     // ----- what the game calls -----
+
+    /// `synchronization.persist_locked_maps`.
+    pub fn persist_locked_maps(&self) -> bool {
+        self.cfg().synchronization.persist_locked_maps
+    }
+
+    /// Saves the locked maps of a stack (and of what it holds) before it goes into a snapshot.
+    pub fn persist_maps(&self, item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+        if self.persist_locked_maps() {
+            maps::persist(item, &self.platform.server_name, &EngineMaps { engine: self }, world);
+        }
+    }
+
+    /// Rebuilds the persisted locked maps of a stack on this server.
+    pub fn apply_maps(&self, item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+        if self.persist_locked_maps() {
+            maps::apply(item, &self.platform.server_name, &EngineMaps { engine: self }, world);
+        }
+    }
 
     pub fn is_locked(&self, player: u128) -> bool {
         self.disabling.load(Ordering::Relaxed) || self.st().locked.contains(&player)
@@ -503,6 +586,10 @@ impl Engine {
                 return;
             }
         };
+        if crate::horizonsync_core::api::fire_pre_sync(player, &s, cause.name()) {
+            self.complete_sync(player, false, cause);
+            return;
+        }
         let plan = player::plan(&s.data, &s.minecraft_version, &self.cfg());
         for (key, e) in &plan.skipped {
             log::warn!(
@@ -533,6 +620,7 @@ impl Engine {
         let slot = self.cfg().synchronization.notification_display_slot.to_ascii_uppercase();
         if ok {
             self.unlock(player);
+            crate::horizonsync_core::api::fire_sync_complete(player, cause.name());
             match slot.as_str() {
                 "CHAT" => self.notice(player, cause.completed(), false),
                 "ACTION_BAR" | "TOAST" => self.notice(player, cause.completed(), true),
@@ -623,6 +711,9 @@ impl Engine {
 
     /// `DataSyncer.persistSnapshot`: during shutdown a DISCONNECT write is verified and retried.
     fn persist(&self, player: u128, s: &Packed) {
+        if crate::horizonsync_core::api::fire_data_save(player, s) {
+            return;
+        }
         let verify = self.disabling.load(Ordering::Relaxed) && s.save_cause == "DISCONNECT";
         if !verify {
             if let Err(e) = self.db.add_snapshot(player, s) {

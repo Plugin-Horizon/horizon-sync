@@ -9,6 +9,7 @@
 //! another data version, an unreadable item or attribute) is refused whole, never applied in part.
 
 pub mod horizonsync_core;
+mod cmdkit;
 #[cfg(any())]
 mod legacy_glue;
 
@@ -16,13 +17,13 @@ use horizonsync_core as core;
 use mod_api::{TriState,
     ArmorStandManipulateEvent, AttackEntityEvent, AttributeModifier, AttributeOperation, Identifier, ItemStack,
     ModifierLifetime, BreakBlockEvent, Command, CommandArgumentValue,
-    CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerOpenedEvent, EntityInteractEvent,
+    CommandInvocation, CommandSource, Compound, Config, ConfigKind, ContainerClickEvent, ContainerOpenedEvent, EntityInteractEvent,
     EntityPlaceEvent, Flow, GameMode, HostSide, Hooks, InteractionResult, ItemPickedUpEvent, ItemTossEvent,
     GameRuleValue, HostTransaction, ItemPlace, ItemResource, LeftClickBlockEvent, LevelRandomHost,
     LivingDropsEvent, LivingIncomingDamageEvent, LivingRef,
     MenuClickedEvent, MenuClosedEvent, MenuRef, MenuReplace, PlayerDiedEvent, NodeDefault, PermissionGatherNodesEvent, PermissionLevel,
-    PermissionNode, PermissionValueType, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
-    PlayerSaveToFileEvent,
+    PermissionNode, PermissionValueType, PlayerAdvancementDoneCancelEvent, PlayerCommandEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef,
+    ModServiceCallEvent, ModServiceError, PlayerSaveToFileEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
     ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
     StatType, Tag, Text, UseItemOnBlockEvent, WorldSavedEvent,
@@ -203,15 +204,10 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     let player = host.player(uuid)?;
     let entity = player.entity();
     let mut nbt = to_core(&Tag::Compound(entity.nbt(host)?));
-    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`. That host call is in an open upstream
-    // pull request (gap-advancements), not in the pinned SDK, so it is behind the `horizon_advancements` cargo feature
-    // (off by default); without it a snapshot carries the advancements over unchanged.
-    #[cfg(feature = "horizon_advancements")]
-    {
-        if core::feature_enabled("husksync:advancements") {
-            if let Some(json) = player.advancements(&*host) {
-                nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
-            }
+    // Advancements: `PlayerAdvancements.save`'s JSON, from `player_advancements`.
+    if core::feature_enabled("husksync:advancements") {
+        if let Some(json) = player.advancements(&*host) {
+            nbt.put(core::records::RECORD_ADVANCEMENTS, core::Nbt::String(json));
         }
     }
     if core::feature_enabled("husksync:statistics") {
@@ -221,6 +217,14 @@ fn read_player(host: &mut dyn ServerHost, uuid: u128) -> Option<core::Nbt> {
     }
     if let Some(data) = player.persistent_data(&*host) {
         nbt.put("NeoForgeData", to_core(&Tag::Compound(data)));
+    }
+    // `persist_locked_maps`: locked maps in the inventory and the ender chest keep their pixels in the map tables.
+    for list in ["Inventory", "EnderItems"] {
+        if let Some(core::Nbt::List(stacks)) = nbt.get_mut(list) {
+            for stack in stacks {
+                core::persist_maps(stack, &mut HostMaps { host: &mut *host });
+            }
+        }
     }
     core::player::mod_data_as_bukkit_values(&mut nbt);
     Some(nbt)
@@ -397,6 +401,36 @@ fn all_players(host: &mut dyn ServerHost) -> Vec<(u128, core::Nbt)> {
 /// cannot be applied: an item the game does not read, or an item saved with another data version
 /// (the engine has no item data fixer for mods, so an older or newer item is refused, never
 /// guessed at).
+/// The game side of the locked-map persistence: maps are looked up and made in the overworld
+/// (`Bukkit.getWorlds().get(0)`, `getDefaultMapWorld`).
+struct HostMaps<'a> {
+    host: &'a mut dyn ServerHost,
+}
+
+impl core::maps::MapWorld for HostMaps<'_> {
+    fn local(&mut self, id: i32) -> Option<core::maps::LocalMap> {
+        let level = self.host.level("minecraft:overworld")?;
+        let state = level.map_data(&*self.host, id)?;
+        Some(core::maps::LocalMap {
+            locked: state.locked,
+            pixels: core::maps::MapPixels {
+                colors: state.colors,
+                dimension: state.dimension,
+                scale: state.scale as i8,
+                x_center: state.center[0],
+                z_center: state.center[1],
+            },
+        })
+    }
+
+    fn create(&mut self, p: &core::maps::MapPixels) -> Option<i32> {
+        let level = self.host.level("minecraft:overworld")?;
+        let id = level.new_map(self.host, [p.x_center, p.z_center], 0, &p.colors)?;
+        let _ = level.set_map_locked(self.host, id, true);
+        Some(id)
+    }
+}
+
 fn stacks(host: &dyn ServerHost, slots: &[Option<core::StoredItem>]) -> Result<Vec<Option<ItemStack>>, String> {
     let version = host.server_data_version();
     slots
@@ -511,8 +545,8 @@ fn menu_items(host: &mut dyn ServerHost, menu: MenuRef, rows: u8) -> Vec<Option<
 
 /// The clicks this mod carries out in an editable menu (`ClickType` ids 0, 1, 2 and 6 with their buttons):
 /// a left or right pick up / put down / swap, a shift-click, a number key or off hand swap (button 40), and
-/// a double click. Drags (5) are carried out from their end; throws (4), the middle button (3) and the
-/// clicks outside the window (slot -999) are not.
+/// a double click. Drags (5) are carried out from their end and throws (4, and a click outside the window)
+/// by `throw_click`; the middle button (3) is not carried out.
 fn carried_click(mode: i32, button: i32) -> bool {
     match mode {
         0 | 1 => matches!(button, 0 | 1),
@@ -553,6 +587,64 @@ fn swap_places(host: &mut dyn ServerHost, tx: &mod_api::Transaction, a: &ItemPla
         ok &= a.insert(host, tx, resource, *count) == *count;
     }
     if ok { Ok(()) } else { Err(()) }
+}
+
+/// Throws in an editable menu (`ClickType.DROP` / `CONTROL_DROP`, and a click outside the window): the key
+/// drops one item of the slot (`button` 0) or the whole stack (1); a click outside drops the cursor's stack
+/// (button 0) or one item of it (1). The items leave the menu and are thrown by the viewer
+/// (`Player.drop(stack, false, true)`), and a refused toss gives them back. True when something moved.
+fn throw_click(host: &mut dyn ServerHost, menu: MenuRef, viewer: u128, slot: Option<usize>, button: i32, mode: i32) -> bool {
+    let (place, all) = match (mode, slot) {
+        (4, Some(slot)) => (ItemPlace::MenuSlot { menu, slot }, button == 1),
+        (0, None) if matches!(button, 0 | 1) => (menu.cursor(), button == 0),
+        _ => return false,
+    };
+    let Some(stack) = place.stack(host) else { return false };
+    let count = if all { stack.count() } else { 1 };
+    let resource = ItemResource::of(&stack);
+    let taken: Result<(), ()> = host.transaction(|host, tx| {
+        if place.extract(host, tx, &resource, count) == count { Ok(()) } else { Err(()) }
+    });
+    if taken.is_err() {
+        return false;
+    }
+    let mut thrown = stack;
+    if thrown.set_count(count).is_err() {
+        return false;
+    }
+    let Some(player) = host.player(viewer) else { return true };
+    match player.drop_stack(host, thrown, true) {
+        Ok(None) => {}
+        // A refused toss: the stack goes back where it came from.
+        Ok(Some(back)) => {
+            let _ = host.transaction(|host, tx| {
+                place.insert(host, tx, &ItemResource::of(&back), back.count());
+                Ok::<(), ()>(())
+            });
+        }
+        Err(_) => {}
+    }
+    true
+}
+
+/// `BukkitEventListener.handlePlayerQuit`: the stack on a leaving player's cursor is dropped where they stand
+/// (unless their data is still locked), so it is not lost with the menu.
+fn drop_cursor(host: &mut dyn ServerHost, uuid: u128) {
+    if core::is_locked(uuid) {
+        return;
+    }
+    let Some(player) = host.player(uuid) else { return };
+    let Some(menu) = player.container_menu(&*host) else { return };
+    let cursor = menu.cursor();
+    let Some(stack) = cursor.stack(host) else { return };
+    let resource = ItemResource::of(&stack);
+    let count = stack.count();
+    let taken: Result<(), ()> = host.transaction(|host, tx| {
+        if cursor.extract(host, tx, &resource, count) == count { Ok(()) } else { Err(()) }
+    });
+    if taken.is_ok() {
+        let _ = player.drop_stack(host, stack, false);
+    }
 }
 
 /// A click in an editable menu, as vanilla's `doClick` does it for the kinds that move items: a left or right
@@ -711,15 +803,22 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
         log(&format!("snapshot not applied for {uuid:032x}: {why}"));
         false
     };
+    let rebuilt = |host: &mut dyn ServerHost, slots: &[Option<core::StoredItem>]| {
+        let mut slots = slots.to_vec();
+        for stored in slots.iter_mut().flatten() {
+            core::apply_maps(&mut stored.item, &mut HostMaps { host: &mut *host });
+        }
+        slots
+    };
     let inventory = match &plan.inventory {
-        Some((slots, held)) => match stacks(&*host, slots) {
+        Some((slots, held)) => match { let slots = rebuilt(&mut *host, slots); stacks(&*host, &slots) } {
             Ok(stacks) => Some((stacks, *held)),
             Err(why) => return refuse(format!("inventory {why}")),
         },
         None => None,
     };
     let ender_chest = match &plan.ender_chest {
-        Some(slots) => match stacks(&*host, slots) {
+        Some(slots) => match { let slots = rebuilt(&mut *host, slots); stacks(&*host, &slots) } {
             Ok(stacks) => Some(stacks),
             Err(why) => return refuse(format!("ender chest {why}")),
         },
@@ -746,13 +845,10 @@ fn apply(host: &mut dyn ServerHost, uuid: u128, plan: &core::ApplyPlan) -> bool 
         }
     }
     // Advancements: `player_set_advancements` loads the saved progress as vanilla loads its file (nothing is awarded: no
-    // toast, chat line or reward). Behind the `horizon_advancements` feature, see `read_player`.
-    #[cfg(feature = "horizon_advancements")]
-    {
-        if let Some(advancements) = &plan.advancements {
-            if !player.set_advancements(host, &advancements.to_string()) {
-                log(&format!("advancements not applied for {uuid:032x}"));
-            }
+    // toast, chat line or reward).
+    if let Some(advancements) = &plan.advancements {
+        if !player.set_advancements(host, &advancements.to_string()) {
+            log(&format!("advancements not applied for {uuid:032x}"));
         }
     }
     // Statistics: each saved count replaces the player's (`Player.resetStat`, then `awardStat`); a statistic the
@@ -876,20 +972,10 @@ fn show(host: &mut dyn ServerHost, uuid: u128, line: Text, overlay: bool) {
 /// The command line as the player typed it, rebuilt from the parsed invocation: the literal path,
 /// then the arguments in parse order. arismoko has no raw-line accessor (TODO(arismoko-api:
 /// command_raw_line)); this matches what the core's parser needs for the usages it registers.
-fn command_line(host: &dyn ServerHost, command: &CommandInvocation) -> String {
-    let mut words = command.literals.clone();
-    for argument in &command.arguments {
-        let text = match &argument.value {
-            CommandArgumentValue::String(s) => s.clone(),
-            CommandArgumentValue::Integer(i) => i.to_string(),
-            CommandArgumentValue::Number(n) => n.to_string(),
-            CommandArgumentValue::Boolean(b) => b.to_string(),
-            CommandArgumentValue::Player(p) => p.name(host).unwrap_or_default(),
-            _ => continue,
-        };
-        words.push(text);
-    }
-    words.join(" ")
+fn command_line(_host: &dyn ServerHost, command: &CommandInvocation) -> String {
+    // The words and arguments in the usage's order (`userdata dump <user> <version> web` has a word after its arguments).
+    let usages: Vec<String> = core::command_usages().into_iter().map(|(usage, _)| usage).collect();
+    cmdkit::rebuild(&usages, command)
 }
 
 /// The items whose use launches a projectile: bow, crossbow, trident, the throwables, the potions and the bottle, the wind
@@ -973,6 +1059,7 @@ impl Hooks for Mod {
         if !core::running() {
             return;
         }
+        drop_cursor(host, event.player);
         // A leaving player is saved after the game stopped letting them be read: then the file the
         // save just wrote is read instead.
         let read = read_player(host, event.player).or_else(|| read_saved(event.directory, event.player));
@@ -983,7 +1070,12 @@ impl Hooks for Mod {
         }
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn player_logged_out(&self, _: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        cmdkit::left(&event.name);
         if !core::running() {
             return;
         }
@@ -1015,6 +1107,16 @@ impl Hooks for Mod {
     fn player_logged_in(&self, _: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
         // Fields `player` and `name` follow the hook's documented arguments; not compiled yet.
         core::on_join(event.player, &event.name);
+        cmdkit::joined(&event.name);
+    }
+
+    /// The service `husksync:api` (`horizonsync_core::api`).
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "husksync:api" {
+            return None;
+        }
+        let text = std::str::from_utf8(&event.payload.0).ok()?;
+        core::service(text).map(|reply| mod_api::PayloadBytes(reply.into_bytes()))
     }
 
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
@@ -1025,6 +1127,17 @@ impl Hooks for Mod {
             return;
         }
         self.saved_now.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Events for the mods that subscribed to `husksync:api`; one that is gone is dropped.
+        let (subscribers, lines) = core::api::take_events();
+        for id in subscribers {
+            let service = format!("{id}:husksync_event");
+            for line in &lines {
+                if let Err(ModServiceError::ProviderNotLoaded) = host.commands().call_mod_service(&service, line.as_bytes()) {
+                    core::api::unsubscribe(&id);
+                    break;
+                }
+            }
+        }
         let players = players_online(&*host);
         let deferred = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()));
         for mut d in deferred {
@@ -1117,6 +1230,7 @@ impl Hooks for Mod {
         let moved = match (event.mode, drag, slot) {
             (5, Some(drag), _) => drag_carry(host, menu, &drag),
             (5, None, _) => false,
+            (4, _, _) | (0, _, None) => throw_click(host, menu, event.uuid, slot, event.button, event.mode),
             (_, _, Some(slot)) => edit_click(host, menu, event.uuid, own, slot, event.button, event.mode),
             _ => false,
         };
@@ -1156,10 +1270,11 @@ impl Hooks for Mod {
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // The public usages (`horizonsync`, `horizonsync about`) and the console-only ones (level 4) are open.
         // Every operator usage carries HuskSync's node (`horizonsync.command.*`, `permission_for`): see
-        // register_node_commands. `player_command` answers the typed line with HuskSync's own denial.
+        // register_node_commands. a player without the node gets vanilla's unknown command, as on Paper.
         for (usage, level) in core::command_usages() {
             // arismoko has no `player_name` argument kind; the core reads the name from the text anyway.
-            let usage = usage.replace(":player_name>", ":word>");
+            // A name completes from the players online (`cmdkit`); the core reads the name from the text anyway.
+            let usage = cmdkit::ask_names(&usage, "husksync");
             if level == 0 || level >= 4 {
                 event.commands.push(Command::new(&usage));
                 continue;
@@ -1173,7 +1288,7 @@ impl Hooks for Mod {
 
     fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
         for (usage, level) in core::command_usages() {
-            let usage = usage.replace(":player_name>", ":word>");
+            let usage = cmdkit::ask_names(&usage, "husksync");
             if level == 0 || level >= 4 {
                 continue;
             }
@@ -1238,36 +1353,9 @@ impl Hooks for Mod {
         if core::refuse_command(event.player, event.command) {
             return Flow::Cancel;
         }
-        // An operator usage the player lacks the node for is hidden from their tree: answer HuskSync's denial
-        // here (also while the mod is off), not the engine's "unknown command". The console is never asked.
-        let line = event.command.trim_start_matches('/').to_owned();
-        let root = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        let sub = line.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
-        if !labels().iter().any(|l| *l == root) || matches!(sub.as_str(), "forceupgrade" | "migrate") {
-            return Flow::Continue;
-        }
-        let Some((node, required)) = core::permission_for(&line) else {
-            return Flow::Continue;
-        };
-        if required == 0 {
-            return Flow::Continue;
-        }
-        let allowed = match host.player(event.player) {
-            Some(p) => p.permission_bool(&mut *host, &boolean_node(&node)).unwrap_or(false),
-            None => false,
-        };
-        if allowed {
-            return Flow::Continue;
-        }
-        event.cancelled = true;
-        for line in core::locale_lines("error_no_permission", &[]) {
-            let text = match host.text_from_json(&line.component.to_string()) {
-                Ok(Some(text)) => text,
-                _ => Text::literal(line.plain),
-            };
-            event.replies.push(text);
-        }
-        Flow::Cancel
+        // An operator usage the player lacks the node for is not in their tree: the engine answers vanilla's
+        // unknown command, as Paper does for a Bukkit command whose permission the sender lacks.
+        Flow::Continue
     }
 
     // Save on death (HuskSync's `saveOnPlayerDeath`) with `items_to_save: DROPS`: the stacks the player
@@ -1397,13 +1485,54 @@ impl Hooks for Mod {
         }
     }
 
-    // HMOD-GAP(locked-inventory-click): no hook answers a click in the player's own inventory screen, which
-    // `BukkitLockedEventListener.onInventoryClick` cancels; only `container_opened` is refused.
+    // `BukkitLockedEventListener.onInventoryClick`: a locked player's click in their own inventory or a container is
+    // cancelled (`container_click`, window 0 and block containers).
+    fn container_click(&self, _: &mut dyn ServerHost, event: &mut ContainerClickEvent<'_>) -> Flow {
+        if core::is_locked(event.player) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    // `BukkitLockedEventListener.onPlayerAdvancement`: a locked player's completed advancement gets no toast,
+    // announcement or reward (the progress itself stays; the sync writes it back with the rest of the data).
+    fn player_advancement_done_cancel(&self, _: &mut dyn ServerHost, event: &mut PlayerAdvancementDoneCancelEvent<'_>) -> Flow {
+        locked_flow(core::is_locked(event.player))
+    }
+}
+
+/// The flow of a hook that only a locked player's action is cancelled in.
+fn locked_flow(locked: bool) -> Flow {
+    if locked { Flow::Cancel } else { Flow::Continue }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn the_commands_of_husksync_are_in_the_tree() {
+        let usages: Vec<String> = core::command_usages().into_iter().map(|(u, _)| u).collect();
+        let paths = cmdkit::literal_paths(&usages);
+        for want in [
+            "husksync about", "husksync status", "husksync dump", "husksync reload", "husksync update", "husksync migrate",
+            "userdata view", "userdata list", "userdata delete", "userdata save", "userdata restore", "userdata pin", "userdata dump",
+            "userdata dump web", "userdata dump file", "playerdata view", "inventory", "openinv", "enderchest", "echest", "openechest",
+        ] {
+            assert!(paths.iter().any(|p| p == want), "{want}");
+        }
+        let words = ["userdata".to_owned(), "dump".to_owned(), "web".to_owned()];
+        let values = [("username".to_owned(), "Alex".to_owned()), ("version".to_owned(), "v1".to_owned())];
+        assert_eq!(cmdkit::rebuild_words(&usages, &words, &values), "userdata dump Alex v1 web");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_locked_players_advancement_is_cancelled() {
+        assert!(matches!(locked_flow(true), Flow::Cancel));
+        assert!(matches!(locked_flow(false), Flow::Continue));
+    }
 
     #[test]
     fn statistics_become_the_vanilla_document_and_back() {

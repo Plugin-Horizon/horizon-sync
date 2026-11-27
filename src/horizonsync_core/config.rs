@@ -84,7 +84,7 @@ pub struct WorldName {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Database {
-    /// MYSQL or MARIADB (both the same client here). MONGO and POSTGRES are not ported.
+    /// MYSQL or MARIADB (both the same client), POSTGRES or MONGO.
     #[serde(rename = "type")]
     pub kind: String,
     pub host: String,

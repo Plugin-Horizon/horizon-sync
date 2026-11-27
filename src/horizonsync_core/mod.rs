@@ -4,13 +4,18 @@
 //!
 //! Derived from HuskSync by William278 (Apache License 2.0); see NOTICE.
 
+pub mod api;
 pub mod commands;
 pub mod config;
 pub mod data;
 pub mod db;
 pub mod engine;
+pub mod maps;
 pub mod messages;
 pub mod nbt;
+pub mod mongo_store;
+pub mod pg_sql;
+pub mod pg_store;
 pub mod player;
 pub mod records;
 pub mod redis_mgr;
@@ -142,6 +147,20 @@ pub fn captured(token: u64, compound: Option<Nbt>) {
     }
 }
 
+/// Saves the locked maps in `item` (and what it holds); a no-op when `persist_locked_maps` is off.
+pub fn persist_maps(item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+    if let Some(e) = engine() {
+        e.persist_maps(item, world);
+    }
+}
+
+/// Rebuilds the persisted locked maps in `item` on this server.
+pub fn apply_maps(item: &mut Nbt, world: &mut dyn maps::MapWorld) {
+    if let Some(e) = engine() {
+        e.apply_maps(item, world);
+    }
+}
+
 /// Whether the player's data is still being loaded (or saved): they must not act.
 pub fn is_locked(player: u128) -> bool {
     engine().is_some_and(|e| e.is_locked(player))
@@ -203,6 +222,11 @@ pub fn command_node(label: &str) -> Option<String> {
 /// The node and default level a command line needs (its sub-command's node when it has one).
 pub fn permission_for(line: &str) -> Option<(String, u8)> {
     commands::permission_for(line)
+}
+
+/// One call of the service `husksync:api`.
+pub fn service(payload: &str) -> Option<String> {
+    api::handle(engine()?, payload)
 }
 
 /// A command line (without its slash); true when it is ours.
