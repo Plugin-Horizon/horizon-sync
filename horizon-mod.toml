@@ -1,6 +1,6 @@
 id = "husksync"
 name = "HorizonSync"
-version = "1.001.0"
+version = "1.1.0"
 description = "Player data sync in HuskSync 4.1's format (MariaDB + Redis) for Horizon. Off until config/horizonsync/mod.toml says enabled = true."
 authors = ["LionSpacer"]
 api = "0.2"
