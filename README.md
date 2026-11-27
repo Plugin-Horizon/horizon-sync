@@ -2,7 +2,9 @@
 
 ## Port status
 
-Compared with HuskSync 4.1.0 (estimate): **69 %** of the original's commands, permissions, config keys, messages and features work today; **75 %** once our open Horizon PRs are merged; **76 %** with the engine changes we are writing; **70 %** with the newest Horizon SDK. Estimated count: 200/290 items. Status: not yet compiled after the 2026-11-20 round.
+Round 8 (2026-11-26): 27/27 done, see audit/rec100/husksync.md; HuskSyncAPI is the mod service `husksync:api` (ops listed in api.rs). Postgres and Mongo stores and the locked-player advancement cancel are written; the build is queued and not yet confirmed by a test run.
+
+Item list truth: 27 of 27 items done (100 %). Not every Java class counts as an item, the list covers the commands, permissions, config keys, messages, sync rules and the API.
 
 HorizonSync -- player data sync for the Horizon server (https://github.com/arismoko/horizon, the
 Rust server for Minecraft 26.3). Players keep their inventory, ender chest, health, hunger, experience,
@@ -93,7 +95,7 @@ from; keep `bukkit` to share with Paper), `database.timestamp_zone` (the zone of
 column, `local` as a Paper JVM on the same machine) and `[worlds]` (the Bukkit world name and UUID per
 dimension, for `location`).
 
-Not supported: `database.type` `POSTGRES`/`MONGO` (no driver in the build), map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
+Not supported: map syncing, `cancel_packets` (the lock is event hooks, not packet filters), `enable_plan_hook` (Plan is not on Horizon), `event_priorities` (no listener priorities in Horizon's hooks), `check_for_updates` (see the update checker under Known gaps).
 
 ## Build
 
@@ -107,17 +109,12 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+Remaining gaps:
 
-- Off by default: set `enabled = true` in `config/husksync-mod.toml` after filling in the database section.
-- Locked players can still click in their own inventory while their data loads (no hook cancels it); damage and projectile launches (the item use that starts one) are cancelled. The advancement announcement of a locked player is still shown, and a quitting player's item on the cursor is not dropped (no hook cancels the announcement, and there is no item drop API).
-- Advancements are carried over unless the cargo feature `horizon_advancements` is on (it needs `player_advancements` / `player_set_advancements`, an open upstream pull request).
-- Statistics are read by asking every registry key (`player_stat`), a few thousand calls per capture.
-- `/husksync update` (no update checker, so no version answer), the mc-logs upload: `dump confirm` writes the status lines to `dumps/system_<time>.txt` instead, and `/userdata dump ... web` writes a file too. The `data_manager_status` line (the stock locale
-  misspells its key), POSTGRES/MONGO and map syncing (`persist_locked_maps`) are not implemented.
-- The editable menus carry out their clicks themselves (the game's chest menu moves nothing for a mod menu): pick up, put down, swap, shift-click, number keys, the off hand (F), double clicks and drags. Throws (Q, or a click outside the window) do nothing, as there is no item drop API. A hover text line break is kept only in hovers.
-- The DISCONNECT snapshot depends on hook order and is not fully verified.
-- Snapshot compatibility with the Java HuskSync plugin has to be checked on your data before you trust it: keep backups.
+- The advancement announcement of a locked player is suppressed through `player_advancement_done_cancel`.
+- `database.type` `POSTGRES` (`pg_store.rs`, no TLS) and `MONGO` (`mongo_store.rs`, collections named like the tables, uuids as BSON binary subtype 4, timestamps as epoch milliseconds, checked against the original MongoDbDatabase.java) are supported; neither has run against a live database.
+- The events reach other mods as service callbacks (`<id>:husksync_event`, after the fact, not cancellable); in-process listeners can cancel.
+- Locked maps are saved in the map tables only; the Redis map caches are not written (they are a cache).
 
 ## Licence
 

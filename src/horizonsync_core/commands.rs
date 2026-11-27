@@ -227,16 +227,26 @@ fn husksync(engine: &Arc<Engine>, sender: &Sender, args: &[String]) {
             None => engine.say(to, "system_dump_confirm", &[]),
             Some("confirm") => {
                 engine.say(to, "system_dump_started", &[]);
-                // The mc-logs upload is not ported: the status lines go to a local file in `dumps/`, nothing leaves the server.
+                // The status lines go to a local file in `dumps/` and, as HuskSync does, to mc-logs (when the
+                // upload works, the link is shown; else the file name).
                 let engine2 = engine.clone();
                 engine.run_job(move |_| {
                     let text: String = status_lines(&engine2).into_iter().map(|(plain, _)| plain + "\n").collect();
                     match write_system_dump(&engine2, &text) {
                         Ok(name) => {
                             engine2.say(to, "system_dump_ready", &[]);
-                            let mut line = part(&name, Some("gray"), false, true, None, None);
-                            line["click_event"] = json!({ "action": "copy_to_clipboard", "value": name });
-                            engine2.tell_component(to, name.clone(), line);
+                            match upload_dump(&text) {
+                                Some(url) => {
+                                    let mut line = part(&url, Some("gray"), false, true, None, None);
+                                    line["click_event"] = json!({ "action": "open_url", "url": url });
+                                    engine2.tell_component(to, url.clone(), line);
+                                }
+                                None => {
+                                    let mut line = part(&name, Some("gray"), false, true, None, None);
+                                    line["click_event"] = json!({ "action": "copy_to_clipboard", "value": name });
+                                    engine2.tell_component(to, name.clone(), line);
+                                }
+                            }
                         }
                         Err(e) => {
                             log::error!("horizonsync: failed to write the system dump: {e}");
@@ -663,6 +673,28 @@ fn dump_to_file(engine: &Engine, s: &Packed, name: &str) -> Result<String, Strin
     std::fs::write(&file, pretty).map_err(|e| e.to_string())?;
     // Like HuskSync (`file.getName()`), show only the file name, never the server path.
     Ok(file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+/// The upload of a dump to mc-logs (`POST https://api.mclo.gs/1/log`, form field `content`): the link of the
+/// log, or none when the service is not reachable or refuses.
+#[cfg(feature = "net")]
+fn upload_dump(text: &str) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(10))
+        .user_agent("HuskSync")
+        .build();
+    let body = agent.post("https://api.mclo.gs/1/log").send_form(&[("content", text)]).ok()?.into_string().ok()?;
+    let answer: Value = serde_json::from_str(&body).ok()?;
+    if answer.get("success").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    answer.get("url").and_then(Value::as_str).map(str::to_owned)
+}
+
+#[cfg(not(feature = "net"))]
+fn upload_dump(_: &str) -> Option<String> {
+    None
 }
 
 /// `/husksync dump confirm`: the status lines as a text file in `dumps/` (HuskSync uploads them to mc-logs).

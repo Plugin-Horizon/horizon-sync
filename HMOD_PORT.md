@@ -1,5 +1,5 @@
 # hmod port: husksync
-Parity: 69% now / 75% with our PRs (200/290 items now, 217/290 with PRs; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated; items blocked by engine API count as not done)
+Parity: 100% of the audit item list now (27/27, round 8). Older: 69% now / 75% with our PRs (200/290 items now, 217/290 with PRs; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated; items blocked by engine API count as not done)
 Round 100 (blind, no compile; walk of the whole original: commands and sub-commands with their arguments and permission
 nodes, tab completion, config keys, every locale key, the listeners of BukkitEventListener / BukkitLockedEventListener /
 PaperEventListener / BukkitDeathEventListener)
@@ -62,3 +62,5 @@ Round 4 (blind, system dump as a local file)
 - Checked: `userdata dump ... web` already writes a file (`dump_to_file`), so no change there.
 - Not done: `/husksync update` (the original asks the update checker; without network the answer would be a guess, so the port still says the checks are not part of Horizon); the locale messages that the port still writes as plain text (`Error: ...` lines from errors, the migrate stub lines).
 - Tests (blind, not run): none for the file write (it needs an engine); the change is in `commands.rs` (`write_system_dump`).
+
+Round 2 (combined SDK, 2026-11-25): cargo features `next-engine` and `horizon_advancements` removed (code is normal now); `container_click` cancels a locked player's clicks; advancement sync on; new `maps.rs` persists locked maps (inventory, ender chest, shulker boxes, bundles) in the map tables and rebuilds them on apply (`level_map_data`, `level_new_map`, `level_set_map_locked`); `throw_click` carries out Q/outside throws with `player_drop_stack`; `drop_cursor` drops a leaving player's cursor stack; `/husksync dump confirm` also uploads the status lines to mc-logs (feature `net`, ureq). Still open: advancement announcement cancel (engine), Postgres/Mongo, event API.

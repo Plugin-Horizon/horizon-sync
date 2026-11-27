@@ -28,12 +28,12 @@ pub struct Db {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Zone {
+pub(crate) enum Zone {
     Local,
     Fixed(i32),
 }
 
-fn parse_zone(s: &str) -> Zone {
+pub(crate) fn parse_zone(s: &str) -> Zone {
     if s.eq_ignore_ascii_case("local") || s.is_empty() {
         return Zone::Local;
     }
@@ -50,16 +50,35 @@ fn parse_zone(s: &str) -> Zone {
 
 impl Zone {
     /// `Timestamp.from(instant)` as JDBC writes it into a DATETIME: the wall time in the zone.
-    fn to_value(self, t: &chrono::DateTime<chrono::FixedOffset>) -> Value {
-        let wall = match self {
+    pub(crate) fn wall(self, t: &chrono::DateTime<chrono::FixedOffset>) -> chrono::NaiveDateTime {
+        match self {
             Zone::Local => t.with_timezone(&chrono::Local).naive_local(),
             Zone::Fixed(secs) => t
                 .with_timezone(&chrono::FixedOffset::east_opt(secs).unwrap_or(*t.offset()))
                 .naive_local(),
-        };
-        // `mysql`'s `chrono` feature binds a wall time as a DATETIME.
-        Value::from(wall)
+        }
     }
+
+    fn to_value(self, t: &chrono::DateTime<chrono::FixedOffset>) -> Value {
+        // `mysql`'s `chrono` feature binds a wall time as a DATETIME.
+        Value::from(self.wall(t))
+    }
+}
+
+/// A snapshot row as read back from any store: the id the database knows it by and the document bytes.
+pub(crate) fn stored_from(version_uuid: String, data: Option<Vec<u8>>, compress: bool) -> Stored {
+    let snapshot = match data {
+        Some(bytes) => Packed::from_bytes(&bytes, compress).map(|mut p| {
+            // The row's id is the one the database knows it by (`deserialize(..., id, ...)`
+            // leaves the JSON's; they are the same unless edited by hand).
+            if p.id.is_empty() {
+                p.id = version_uuid.clone();
+            }
+            p
+        }),
+        None => Err("no data".into()),
+    };
+    Stored { version_uuid, snapshot }
 }
 
 /// The schema, as `mariadb_schema.sql` (MySQL gets the same statements).
@@ -197,6 +216,49 @@ impl Db {
         }
     }
 
+    /// `getMapData`, with the column's adapter stripped: the map file.
+    pub fn map_file(&self, server: &str, id: i32) -> Result<Option<Vec<u8>>, String> {
+        let mut c = self.conn()?;
+        let row: Option<Vec<u8>> = c
+            .exec_first(
+                self.q("SELECT `data` FROM `%map_data_table%` WHERE `server_name`=? AND `map_id`=? LIMIT 1;"),
+                (server, id),
+            )
+            .map_err(err)?;
+        Ok(row.and_then(|column| crate::horizonsync_core::maps::from_column(&column)))
+    }
+
+    /// `saveMapData`.
+    pub fn save_map_file(&self, server: &str, id: i32, file: &[u8]) -> Result<(), String> {
+        let mut c = self.conn()?;
+        let column = crate::horizonsync_core::maps::to_column(file, self.compress);
+        c.exec_drop(
+            self.q("INSERT INTO `%map_data_table%` (`server_name`,`map_id`,`data`) VALUES (?,?,?);"),
+            (server, id, column),
+        )
+        .map_err(err)
+    }
+
+    /// `getBoundMapId`.
+    pub fn bound_map_id(&self, from_server: &str, from_id: i32, to_server: &str) -> Result<Option<i32>, String> {
+        let mut c = self.conn()?;
+        c.exec_first(
+            self.q("SELECT `to_id` FROM `%map_ids_table%` WHERE `from_server_name`=? AND `from_id`=? AND `to_server_name`=? LIMIT 1;"),
+            (from_server, from_id, to_server),
+        )
+        .map_err(err)
+    }
+
+    /// `setMapBinding`.
+    pub fn set_map_binding(&self, from_server: &str, from_id: i32, to_server: &str, to_id: i32) -> Result<(), String> {
+        let mut c = self.conn()?;
+        c.exec_drop(
+            self.q("INSERT INTO `%map_ids_table%` (`from_server_name`,`from_id`,`to_server_name`,`to_id`) VALUES (?,?,?,?);"),
+            (from_server, from_id, to_server, to_id),
+        )
+        .map_err(err)
+    }
+
     pub fn user_by_name(&self, name: &str) -> Result<Option<(u128, String)>, String> {
         let mut c = self.conn()?;
         let row: Option<(String, String)> = c
@@ -213,19 +275,7 @@ impl Db {
 
     fn stored(&self, row: Row) -> Stored {
         let version_uuid: String = row.get("version_uuid").unwrap_or_default();
-        let data: Option<Vec<u8>> = row.get("data");
-        let snapshot = match data {
-            Some(bytes) => Packed::from_bytes(&bytes, self.compress).map(|mut p| {
-                // The row's id is the one the database knows it by (`deserialize(..., id, ...)`
-                // leaves the JSON's; they are the same unless edited by hand).
-                if p.id.is_empty() {
-                    p.id = version_uuid.clone();
-                }
-                p
-            }),
-            None => Err("no data".into()),
-        };
-        Stored { version_uuid, snapshot }
+        stored_from(version_uuid, row.get("data"), self.compress)
     }
 
     pub fn latest_snapshot(&self, player: u128) -> Result<Option<Stored>, String> {
